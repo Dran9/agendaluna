@@ -46,6 +46,11 @@ if (fs.existsSync(bookingDist)) {
       next();
       return;
     }
+    const acceptsHtml = req.accepts(['html', 'json', 'text']) === 'html';
+    if (!acceptsHtml) {
+      next();
+      return;
+    }
     res.sendFile(path.join(bookingDist, 'index.html'));
   });
 }

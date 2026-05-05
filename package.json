@@ -9,7 +9,7 @@
     "dev:admin": "vite apps/admin --host 127.0.0.1 --port 5173",
     "dev:booking": "vite apps/booking --host 127.0.0.1 --port 5174",
     "build": "npm run build:admin && npm run build:booking",
-    "build:admin": "vite build apps/admin --outDir ../../dist/admin --emptyOutDir",
+    "build:admin": "vite build apps/admin --base=/admin/ --outDir ../../dist/admin --emptyOutDir",
     "build:booking": "vite build apps/booking --outDir ../../dist/booking --emptyOutDir",
     "migrate": "node server/db/migrate.js",
     "seed": "node server/db/seed.js",
