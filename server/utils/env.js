@@ -1,7 +1,7 @@
 import { z } from 'zod';
 
 const EnvSchema = z.object({
-  NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
+  NODE_ENV: z.string().default('development'),
   PORT: z.coerce.number().int().min(1).max(65535).default(3000),
   DB_HOST: z.string().min(1).default('127.0.0.1'),
   DB_PORT: z.coerce.number().int().min(1).max(65535).default(3306),
@@ -11,7 +11,7 @@ const EnvSchema = z.object({
   DB_CONNECTION_LIMIT: z.coerce.number().int().min(1).max(50).default(10),
   DB_TIMEZONE: z.string().default('-04:00'),
   JWT_SECRET: z.string().min(16).default('agenda-luna-dev-secret-change-me'),
-  MESSAGING_PROVIDER: z.enum(['test_outbox', 'whatsapp_live', 'log_only']).default('test_outbox'),
+  MESSAGING_PROVIDER: z.string().default('test_outbox'),
   WA_TOKEN: z.string().optional().default(''),
   WA_PHONE_ID: z.string().optional().default(''),
   WA_VERIFY_TOKEN: z.string().optional().default(''),
@@ -29,4 +29,24 @@ if (!parsed.success) {
   throw new Error(`Invalid environment configuration:\n${issues}`);
 }
 
-export const env = parsed.data;
+function normalizeNodeEnv(rawValue) {
+  const normalized = String(rawValue || 'development').toLowerCase();
+  if (['development', 'test', 'production'].includes(normalized)) {
+    return normalized;
+  }
+  return 'development';
+}
+
+function normalizeMessagingProvider(rawValue) {
+  const normalized = String(rawValue || 'test_outbox').toLowerCase();
+  if (['test_outbox', 'whatsapp_live', 'log_only'].includes(normalized)) {
+    return normalized;
+  }
+  return 'test_outbox';
+}
+
+export const env = {
+  ...parsed.data,
+  NODE_ENV: normalizeNodeEnv(parsed.data.NODE_ENV),
+  MESSAGING_PROVIDER: normalizeMessagingProvider(parsed.data.MESSAGING_PROVIDER)
+};
