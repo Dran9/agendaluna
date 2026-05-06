@@ -63,10 +63,6 @@ export function createApp() {
 export const app = createApp();
 
 function shouldStartServer() {
-  if (env.NODE_ENV === 'test') {
-    return false;
-  }
-
   const mainArg = process.argv[1] ? path.resolve(process.argv[1]) : '';
   return mainArg === __filename;
 }
