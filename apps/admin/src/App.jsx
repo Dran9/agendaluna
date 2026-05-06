@@ -7,7 +7,6 @@ import { ClientsView } from './views/ClientsView'
 import { TherapistsView } from './views/TherapistsView'
 import { FinancesView } from './views/FinancesView'
 import { SettingsView } from './views/SettingsView'
-import { LoginView } from './views/LoginView'
 
 const TOKEN_STORAGE_KEY = 'agenda_luna_admin_token'
 
@@ -30,12 +29,6 @@ function toViewTitle(view) {
 export default function App({ initialTheme, onToggleTheme }) {
   const [activeView, setActiveView] = useState('control')
   const [searchText, setSearchText] = useState('')
-  const [authState, setAuthState] = useState(() => ({
-    token: localStorage.getItem(TOKEN_STORAGE_KEY) || '',
-    user: null,
-    loggingIn: false,
-    error: ''
-  }))
 
   const [catalogState, setCatalogState] = useState({
     loading: false,
@@ -93,106 +86,47 @@ export default function App({ initialTheme, onToggleTheme }) {
     saveError: ''
   })
 
-  const handleLogin = useCallback(async ({ centerId, email, password }) => {
-    setAuthState((prev) => ({ ...prev, loggingIn: true, error: '' }))
-    try {
-      const response = await fetch(apiUrl('/api/admin/auth/login'), {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ centerId, email, password })
-      })
-      const payload = await readJson(response)
-      localStorage.setItem(TOKEN_STORAGE_KEY, payload.token)
-      setAuthState({
-        token: payload.token,
-        user: payload.user || null,
-        loggingIn: false,
-        error: ''
-      })
-    } catch (error) {
-      setAuthState((prev) => ({
-        ...prev,
-        loggingIn: false,
-        error: error.message || 'No se pudo iniciar sesión.'
-      }))
+  const ensureToken = useCallback(async () => {
+    const stored = localStorage.getItem(TOKEN_STORAGE_KEY)
+    if (stored) {
+      return stored
     }
-  }, [])
 
-  const handleRequestDevToken = useCallback(async () => {
     if (!import.meta.env.DEV) {
-      return
+      throw new Error('No hay sesión activa de admin para este entorno.')
     }
-    setAuthState((prev) => ({ ...prev, loggingIn: true, error: '' }))
-    try {
-      const tokenResponse = await fetch(apiUrl('/api/admin/auth/dev-token'), {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ centerId: 1, email: 'admin@luna.local' })
-      })
-      const payload = await readJson(tokenResponse)
-      localStorage.setItem(TOKEN_STORAGE_KEY, payload.token)
-      setAuthState({
-        token: payload.token,
-        user: {
-          id: 0,
-          fullName: 'Admin Dev',
-          email: 'admin@luna.local',
-          centerId: 1,
-          role: 'admin'
-        },
-        loggingIn: false,
-        error: ''
-      })
-    } catch (error) {
-      setAuthState((prev) => ({
-        ...prev,
-        loggingIn: false,
-        error: error.message || 'No se pudo obtener token de desarrollo.'
-      }))
-    }
-  }, [])
 
-  const handleLogout = useCallback(() => {
-    localStorage.removeItem(TOKEN_STORAGE_KEY)
-    setAuthState({
-      token: '',
-      user: null,
-      loggingIn: false,
-      error: ''
+    const tokenResponse = await fetch(apiUrl('/api/admin/auth/dev-token'), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ centerId: 1, email: 'admin@luna.local' })
     })
-    setSearchText('')
-    setActiveView('control')
+
+    const tokenPayload = await readJson(tokenResponse)
+    localStorage.setItem(TOKEN_STORAGE_KEY, tokenPayload.token)
+    return tokenPayload.token
   }, [])
 
   const authedFetch = useCallback(
-    async (path, options = {}) => {
-      if (!authState.token) {
-        throw new Error('No hay sesión activa de admin.')
-      }
+    async (path, options = {}, retried = false) => {
+      const token = await ensureToken()
 
       const response = await fetch(apiUrl(path), {
         ...options,
         headers: {
           ...(options.headers || {}),
-          Authorization: `Bearer ${authState.token}`
+          Authorization: `Bearer ${token}`
         }
       })
 
-      if (response.status === 401) {
+      if (response.status === 401 && !retried && import.meta.env.DEV) {
         localStorage.removeItem(TOKEN_STORAGE_KEY)
-        setAuthState((prev) => ({
-          ...prev,
-          token: '',
-          user: null,
-          loggingIn: false,
-          error: 'Sesión expirada. Inicia sesión nuevamente.'
-        }))
-        throw new Error('Sesión expirada. Inicia sesión nuevamente.')
+        return authedFetch(path, options, true)
       }
 
       return readJson(response)
     },
-    [authState.token]
+    [ensureToken]
   )
 
   const loadCatalog = useCallback(async () => {
@@ -568,21 +502,12 @@ export default function App({ initialTheme, onToggleTheme }) {
     [authedFetch, loadFinances]
   )
 
-  const hasSession = Boolean(authState.token)
-
   useEffect(() => {
-    if (!hasSession) {
-      return
-    }
     loadCatalog()
     loadControl()
-  }, [hasSession, loadCatalog, loadControl])
+  }, [loadCatalog, loadControl])
 
   useEffect(() => {
-    if (!hasSession) {
-      return undefined
-    }
-
     if (activeView === 'clientes') {
       const timeout = setTimeout(() => {
         loadClients(searchText)
@@ -603,21 +528,9 @@ export default function App({ initialTheme, onToggleTheme }) {
     }
 
     return undefined
-  }, [hasSession, activeView, loadCatalog, loadClients, loadTherapists, loadFinances, searchText])
+  }, [activeView, loadCatalog, loadClients, loadTherapists, loadFinances, searchText])
 
   const topbarTitle = useMemo(() => toViewTitle(activeView), [activeView])
-
-  if (!hasSession) {
-    return (
-      <LoginView
-        loading={authState.loggingIn}
-        error={authState.error}
-        onLogin={handleLogin}
-        onRequestDevToken={handleRequestDevToken}
-        showDevShortcut={import.meta.env.DEV}
-      />
-    )
-  }
 
   return (
     <div className="shell">
@@ -647,7 +560,6 @@ export default function App({ initialTheme, onToggleTheme }) {
               ? 'Buscar cliente por nombre o WhatsApp'
               : 'Búsqueda disponible en Clientes'
           }
-          onLogout={handleLogout}
         />
 
         <main className={`content-grid ${activeView === 'control' ? '' : 'single-layout'}`}>

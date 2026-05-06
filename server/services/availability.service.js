@@ -177,34 +177,12 @@ async function getResourceBlocks(connection, centerId, resourceType, resourceIds
   return arrayToMap(rows, 'resource_id');
 }
 
-async function getClaimConflicts(
-  connection,
-  centerId,
-  resourceType,
-  resourceIds,
-  slotStart,
-  slotEnd,
-  excludedAppointmentId = null
-) {
+async function getClaimConflicts(connection, centerId, resourceType, resourceIds, slotStart, slotEnd) {
   if (!resourceIds.length) {
     return new Map();
   }
 
   const inClause = buildInClause(resourceIds);
-  let exclusionSql = '';
-  const params = [
-    centerId,
-    resourceType,
-    ...inClause.params,
-    toMySqlDateTime(slotStart),
-    toMySqlDateTime(slotEnd)
-  ];
-
-  if (excludedAppointmentId !== null) {
-    exclusionSql = ' AND appointment_id <> ?';
-    params.push(Number(excludedAppointmentId));
-  }
-
   const [rows] = await connection.query(
     `SELECT resource_id, COUNT(*) AS conflict_count
      FROM appointment_resource_claims
@@ -213,36 +191,25 @@ async function getClaimConflicts(
        AND resource_id IN ${inClause.clause}
        AND claim_time >= ?
        AND claim_time < ?
-       ${exclusionSql}
      GROUP BY resource_id`,
-    params
+    [
+      centerId,
+      resourceType,
+      ...inClause.params,
+      toMySqlDateTime(slotStart),
+      toMySqlDateTime(slotEnd)
+    ]
   );
 
   return arrayToMap(rows, 'resource_id');
 }
 
-async function getAppointmentConflicts(
-  connection,
-  centerId,
-  idColumn,
-  resourceIds,
-  slotStart,
-  slotEnd,
-  excludedAppointmentId = null
-) {
+async function getAppointmentConflicts(connection, centerId, idColumn, resourceIds, slotStart, slotEnd) {
   if (!resourceIds.length) {
     return new Map();
   }
 
   const inClause = buildInClause(resourceIds);
-  let exclusionSql = '';
-  const params = [centerId, ...inClause.params, toMySqlDateTime(slotEnd), toMySqlDateTime(slotStart)];
-
-  if (excludedAppointmentId !== null) {
-    exclusionSql = ' AND id <> ?';
-    params.push(Number(excludedAppointmentId));
-  }
-
   const [rows] = await connection.query(
     `SELECT ${idColumn} AS resource_id, COUNT(*) AS conflict_count
      FROM appointments
@@ -251,9 +218,8 @@ async function getAppointmentConflicts(
        AND ${idColumn} IN ${inClause.clause}
        AND starts_at < ?
        AND ends_at > ?
-       ${exclusionSql}
      GROUP BY ${idColumn}`,
-    params
+    [centerId, ...inClause.params, toMySqlDateTime(slotEnd), toMySqlDateTime(slotStart)]
   );
 
   return arrayToMap(rows, 'resource_id');
@@ -264,8 +230,7 @@ export async function findSlotCandidates(connection, {
   serviceId,
   slotStart,
   therapistId = null,
-  durationMin = null,
-  excludedAppointmentId = null
+  durationMin = null
 }) {
   const service = await getServiceRow(connection, centerId, serviceId);
   if (!service) {
@@ -309,18 +274,10 @@ export async function findSlotCandidates(connection, {
     getResourceSchedules(connection, centerId, 'room', roomIds, weekday),
     getResourceBlocks(connection, centerId, 'therapist', therapistIds, start, end),
     getResourceBlocks(connection, centerId, 'room', roomIds, start, end),
-    getClaimConflicts(connection, centerId, 'therapist', therapistIds, start, end, excludedAppointmentId),
-    getClaimConflicts(connection, centerId, 'room', roomIds, start, end, excludedAppointmentId),
-    getAppointmentConflicts(
-      connection,
-      centerId,
-      'therapist_id',
-      therapistIds,
-      start,
-      end,
-      excludedAppointmentId
-    ),
-    getAppointmentConflicts(connection, centerId, 'room_id', roomIds, start, end, excludedAppointmentId)
+    getClaimConflicts(connection, centerId, 'therapist', therapistIds, start, end),
+    getClaimConflicts(connection, centerId, 'room', roomIds, start, end),
+    getAppointmentConflicts(connection, centerId, 'therapist_id', therapistIds, start, end),
+    getAppointmentConflicts(connection, centerId, 'room_id', roomIds, start, end)
   ]);
 
   const availableTherapists = therapists.filter((therapist) => {
@@ -398,8 +355,7 @@ export async function listAvailability(connection, {
   date,
   therapistId = null,
   slotStepMin = DEFAULT_SLOT_STEP_MIN,
-  maxSlots = 18,
-  excludedAppointmentId = null
+  maxSlots = 18
 }) {
   const serviceRow = await getServiceRow(connection, centerId, serviceId);
   if (!serviceRow) {
@@ -424,8 +380,7 @@ export async function listAvailability(connection, {
       centerId,
       serviceId,
       slotStart,
-      therapistId,
-      excludedAppointmentId
+      therapistId
     });
 
     if (!slotResult.candidates.length) {

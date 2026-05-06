@@ -1,4 +1,4 @@
-import { Bell, MagnifyingGlass, Question, SignOut } from '@phosphor-icons/react';
+import { Bell, MagnifyingGlass, Question } from '@phosphor-icons/react';
 
 export function Topbar({
   title = 'Control',
@@ -6,8 +6,7 @@ export function Topbar({
   searchValue = '',
   onSearchChange,
   searchDisabled = false,
-  searchPlaceholder = 'Buscar cliente',
-  onLogout
+  searchPlaceholder = 'Buscar cliente'
 }) {
   return (
     <header className="topbar">
@@ -27,12 +26,6 @@ export function Topbar({
       </div>
 
       <div className="topbar-actions">
-        {onLogout ? (
-          <button type="button" className="topbar-logout" onClick={onLogout} title="Cerrar sesión">
-            <SignOut size={16} />
-            <span>Salir</span>
-          </button>
-        ) : null}
         <button type="button" aria-label="Ayuda (próximamente)" disabled title="Próximamente">
           <Question size={18} />
         </button>
