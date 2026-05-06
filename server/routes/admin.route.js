@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { getPool, withTransaction } from '../db/pool.js';
 import { authRequired, signAdminToken } from '../utils/jwt.js';
+import { verifyPassword } from '../utils/passwords.js';
 import { asyncHandler } from '../utils/http.js';
 import { env } from '../utils/env.js';
 import { AppError, ConflictError, ValidationError } from '../services/errors.js';
@@ -23,6 +24,12 @@ const pool = getPool();
 const DevTokenSchema = z.object({
   centerId: z.coerce.number().int().positive().default(1),
   email: z.string().email().default('admin@luna.local')
+});
+
+const LoginSchema = z.object({
+  centerId: z.coerce.number().int().positive().default(1),
+  email: z.string().email().max(190),
+  password: z.string().min(8).max(255)
 });
 
 const ClientsQuerySchema = z.object({
@@ -203,6 +210,15 @@ const RescheduleAppointmentSchema = z.object({
   note: z.string().max(500).optional().or(z.literal(''))
 });
 
+const TERMINAL_APPOINTMENT_STATUSES = new Set(['completed', 'cancelled', 'no_show']);
+const ALLOWED_STATUS_TRANSITIONS = {
+  pending: new Set(['confirmed', 'completed', 'cancelled', 'no_show']),
+  confirmed: new Set(['completed', 'cancelled', 'no_show']),
+  completed: new Set(),
+  cancelled: new Set(),
+  no_show: new Set()
+};
+
 function toNullable(value) {
   if (value === undefined || value === null || value === '') {
     return null;
@@ -259,6 +275,32 @@ function normalizeScheduleEntries(entries) {
   }
 
   return normalized;
+}
+
+function buildDefaultRoomScheduleEntries() {
+  const weekdays = [1, 2, 3, 4, 5, 6];
+  return weekdays.map((weekday) => ({
+    weekday,
+    startTime: '08:00:00',
+    endTime: '18:00:00',
+    isActive: true
+  }));
+}
+
+function assertAllowedStatusTransition(previousStatus, nextStatus) {
+  const allowedNext = ALLOWED_STATUS_TRANSITIONS[previousStatus];
+  if (!allowedNext) {
+    throw new ConflictError(`Cannot change appointment from status ${previousStatus}`);
+  }
+
+  if (!allowedNext.has(nextStatus)) {
+    if (TERMINAL_APPOINTMENT_STATUSES.has(previousStatus)) {
+      throw new ConflictError(
+        'Terminal appointments cannot be reactivated from completed/cancelled/no_show'
+      );
+    }
+    throw new ConflictError(`Status transition from ${previousStatus} to ${nextStatus} is not allowed`);
+  }
 }
 
 function pickAdminCandidate(slot, { therapistId = null, roomId = null } = {}) {
@@ -395,6 +437,61 @@ function resolveDateRange(query) {
     to: `${fallbackNext}-01`
   };
 }
+
+router.post(
+  '/auth/login',
+  asyncHandler(async (req, res) => {
+    const input = LoginSchema.parse(req.body || {});
+    const email = input.email.trim().toLowerCase();
+
+    const [rows] = await pool.query(
+      `SELECT
+         au.id,
+         au.center_id,
+         au.full_name,
+         au.email,
+         au.password_hash,
+         au.role,
+         au.is_active,
+         c.status AS center_status
+       FROM admin_users au
+       JOIN centers c ON c.id = au.center_id
+       WHERE au.center_id = ?
+         AND LOWER(au.email) = ?
+       LIMIT 1`,
+      [input.centerId, email]
+    );
+
+    const user = rows[0];
+    if (!user || !verifyPassword(input.password, user.password_hash)) {
+      throw new AppError('Invalid email or password', 401, 'unauthorized');
+    }
+
+    if (!Boolean(user.is_active) || user.center_status !== 'active') {
+      throw new AppError('Admin user is inactive', 403, 'forbidden');
+    }
+
+    const token = signAdminToken({
+      sub: String(user.id),
+      id: user.id,
+      centerId: user.center_id,
+      role: user.role,
+      email: user.email
+    });
+
+    res.json({
+      ok: true,
+      token,
+      user: {
+        id: user.id,
+        fullName: user.full_name,
+        email: user.email,
+        centerId: user.center_id,
+        role: user.role
+      }
+    });
+  })
+);
 
 router.post(
   '/auth/dev-token',
@@ -1399,6 +1496,22 @@ router.post(
         );
       }
 
+      for (const schedule of buildDefaultRoomScheduleEntries()) {
+        await connection.query(
+          `INSERT INTO resource_schedules
+            (center_id, resource_type, resource_id, weekday, start_time, end_time, is_active)
+           VALUES (?, 'room', ?, ?, ?, ?, ?)`,
+          [
+            centerId,
+            roomId,
+            schedule.weekday,
+            schedule.startTime,
+            schedule.endTime,
+            schedule.isActive ? 1 : 0
+          ]
+        );
+      }
+
       const [rows] = await connection.query(
         `SELECT id, name, capacity, is_active
          FROM rooms
@@ -1858,6 +1971,8 @@ router.patch(
         return serializeAppointmentRow(current);
       }
 
+      assertAllowedStatusTransition(current.status, input.status);
+
       await connection.query(
         `UPDATE appointments
          SET status = ?,
@@ -1866,7 +1981,7 @@ router.patch(
         [input.status, centerId, appointmentId]
       );
 
-      if (['completed', 'cancelled', 'no_show'].includes(input.status)) {
+      if (TERMINAL_APPOINTMENT_STATUSES.has(input.status)) {
         await releaseClaimsTx(connection, { centerId, appointmentId });
       }
 
@@ -1936,7 +2051,8 @@ router.patch(
         serviceId: current.service_id,
         date: toDateOnlyInAppTz(requestedStart),
         therapistId: input.therapistId ?? null,
-        maxSlots: 100
+        maxSlots: 100,
+        excludedAppointmentId: appointmentId
       });
 
       const requestedMinute = toComparableMinute(input.startsAt);

@@ -38,6 +38,15 @@ export function getPool() {
   return pool;
 }
 
+export async function closePool() {
+  if (!pool) {
+    return;
+  }
+
+  await pool.end();
+  pool = undefined;
+}
+
 export async function withTransaction(callback) {
   const poolInstance = getPool();
   const connection = await poolInstance.getConnection();
