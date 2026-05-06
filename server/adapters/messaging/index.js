@@ -1,5 +1,6 @@
 import { env } from '../../utils/env.js';
 import { sendMessage as sendTestOutboxMessage } from './testOutbox.adapter.js';
+import { sendWhatsappLiveMessage } from './whatsappLive.adapter.js';
 
 async function sendLogOnly(message) {
   // eslint-disable-next-line no-console
@@ -8,8 +9,7 @@ async function sendLogOnly(message) {
 }
 
 async function sendWhatsappLiveStub(message) {
-  // Placeholder for future WhatsApp Cloud adapter.
-  return sendLogOnly({ channel: 'whatsapp_live_stub', ...message });
+  return sendWhatsappLiveMessage({ channel: 'whatsapp_live', ...message });
 }
 
 export async function sendBookingMessage(message) {

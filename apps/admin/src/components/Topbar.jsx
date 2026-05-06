@@ -1,16 +1,25 @@
 import { Bell, MagnifyingGlass, Question } from '@phosphor-icons/react';
 
-export function Topbar() {
+export function Topbar({
+  title = 'Control',
+  subtitle = 'Luna Mandala',
+  searchValue = '',
+  onSearchChange
+}) {
   return (
     <header className="topbar">
       <div className="topbar-title">
-        <h1>Control</h1>
-        <p>Luna Mandala</p>
+        <h1>{title}</h1>
+        <p>{subtitle}</p>
       </div>
 
       <div className="topbar-search" role="search">
         <MagnifyingGlass size={18} />
-        <input placeholder="Buscar cliente, terapeuta o cita" />
+        <input
+          value={searchValue}
+          placeholder="Buscar cliente, terapeuta o cita"
+          onChange={(event) => onSearchChange?.(event.target.value)}
+        />
       </div>
 
       <div className="topbar-actions">

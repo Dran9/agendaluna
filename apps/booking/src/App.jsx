@@ -127,6 +127,18 @@ export default function App() {
   const [confirming, setConfirming] = useState(false);
   const [confirmError, setConfirmError] = useState('');
   const [confirmedAppointment, setConfirmedAppointment] = useState(null);
+  const [manageOpen, setManageOpen] = useState(false);
+  const [manageLoading, setManageLoading] = useState(false);
+  const [manageError, setManageError] = useState('');
+  const [manageSuccess, setManageSuccess] = useState('');
+  const [manageAppointmentId, setManageAppointmentId] = useState('');
+  const [manageWhatsapp, setManageWhatsapp] = useState('');
+  const [manageToken, setManageToken] = useState('');
+  const [managedAppointment, setManagedAppointment] = useState(null);
+  const [manageDate, setManageDate] = useState(dateInputTodayInBolivia());
+  const [manageSlots, setManageSlots] = useState([]);
+  const [manageSelectedSlot, setManageSelectedSlot] = useState(null);
+  const [cancelReason, setCancelReason] = useState('');
 
   const selectedService = useMemo(
     () => catalog.services.find((service) => service.id === selectedServiceId) || catalog.services[0],
@@ -267,6 +279,170 @@ export default function App() {
       setConfirmError(error.message || 'No se pudo confirmar la cita.');
     } finally {
       setConfirming(false);
+    }
+  }
+
+  async function onRequestManageToken() {
+    if (!manageAppointmentId.trim() || !manageWhatsapp.trim()) {
+      setManageError('Ingresa ID de cita y WhatsApp para continuar.');
+      return;
+    }
+
+    setManageLoading(true);
+    setManageError('');
+    setManageSuccess('');
+
+    try {
+      const response = await fetch(apiUrl('/api/public/manage-token'), {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          centerId: catalog.center.id,
+          appointmentId: Number(manageAppointmentId),
+          whatsappPhone: manageWhatsapp.trim()
+        })
+      });
+
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload?.message || 'No se pudo validar la cita.');
+      }
+
+      setManageToken(payload.manageToken || '');
+      setManagedAppointment(payload.appointment || null);
+      setManageDate(dateInputTodayInBolivia());
+      setManageSlots([]);
+      setManageSelectedSlot(null);
+    } catch (error) {
+      setManageError(error.message || 'No se pudo validar la cita.');
+    } finally {
+      setManageLoading(false);
+    }
+  }
+
+  async function onSearchManageAvailability() {
+    if (!managedAppointment?.serviceId) {
+      setManageError('Primero valida la cita.');
+      return;
+    }
+
+    setManageLoading(true);
+    setManageError('');
+    setManageSuccess('');
+
+    try {
+      const response = await fetch(apiUrl('/api/public/availability'), {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          centerId: catalog.center.id,
+          serviceId: managedAppointment.serviceId,
+          therapistId: managedAppointment.therapistId || null,
+          date: manageDate
+        })
+      });
+
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload?.message || 'No se pudo cargar disponibilidad para reagendar.');
+      }
+
+      setManageSlots(payload.slots || []);
+      setManageSelectedSlot(null);
+
+      if (!payload?.slots?.length) {
+        setManageError('No hay slots para esa fecha.');
+      }
+    } catch (error) {
+      setManageSlots([]);
+      setManageError(error.message || 'No se pudo cargar disponibilidad.');
+    } finally {
+      setManageLoading(false);
+    }
+  }
+
+  async function onRescheduleAppointment() {
+    if (!manageToken || !managedAppointment?.id) {
+      setManageError('Primero valida la cita para gestionar.');
+      return;
+    }
+
+    if (!manageSelectedSlot?.startsAt) {
+      setManageError('Selecciona un horario para reagendar.');
+      return;
+    }
+
+    setManageLoading(true);
+    setManageError('');
+    setManageSuccess('');
+
+    try {
+      const response = await fetch(apiUrl('/api/public/reschedule'), {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          centerId: catalog.center.id,
+          appointmentId: managedAppointment.id,
+          manageToken,
+          startsAt: manageSelectedSlot.startsAt,
+          therapistId: manageSelectedSlot?.selectedCandidate?.therapistId || null
+        })
+      });
+
+      const payload = await response.json();
+      if (!response.ok) {
+        if (response.status === 409) {
+          throw new Error('Ese horario ya no está disponible.');
+        }
+        throw new Error(payload?.message || 'No se pudo reagendar.');
+      }
+
+      setManagedAppointment(payload.appointment || managedAppointment);
+      setManageSuccess('Cita reagendada correctamente.');
+      setManageSlots([]);
+      setManageSelectedSlot(null);
+    } catch (error) {
+      setManageError(error.message || 'No se pudo reagendar.');
+    } finally {
+      setManageLoading(false);
+    }
+  }
+
+  async function onCancelAppointment() {
+    if (!manageToken || !managedAppointment?.id) {
+      setManageError('Primero valida la cita para gestionar.');
+      return;
+    }
+
+    setManageLoading(true);
+    setManageError('');
+    setManageSuccess('');
+
+    try {
+      const response = await fetch(apiUrl('/api/public/cancel'), {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          centerId: catalog.center.id,
+          appointmentId: managedAppointment.id,
+          manageToken,
+          reason: cancelReason.trim()
+        })
+      });
+
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload?.message || 'No se pudo cancelar la cita.');
+      }
+
+      setManagedAppointment(payload.appointment || managedAppointment);
+      setManageSuccess('Cita cancelada correctamente.');
+      setManageSlots([]);
+      setManageSelectedSlot(null);
+    } catch (error) {
+      setManageError(error.message || 'No se pudo cancelar la cita.');
+    } finally {
+      setManageLoading(false);
     }
   }
 
@@ -429,13 +605,114 @@ export default function App() {
           </section>
         ) : null}
 
+        {manageOpen ? (
+          <section className="manage-panel">
+            <h2>Gestionar mi cita</h2>
+            <p>
+              Si ya tienes una cita confirmada, puedes validarla con tu ID y WhatsApp para
+              reagendar o cancelar.
+            </p>
+
+            <input
+              value={manageAppointmentId}
+              onChange={(event) => setManageAppointmentId(event.target.value)}
+              placeholder="ID de cita (ej. 22)"
+            />
+            <input
+              value={manageWhatsapp}
+              onChange={(event) => setManageWhatsapp(event.target.value)}
+              placeholder="WhatsApp usado en la reserva"
+            />
+            <button type="button" className="primary-btn" onClick={onRequestManageToken}>
+              {manageLoading ? 'Validando...' : 'Validar cita'}
+            </button>
+
+            {managedAppointment ? (
+              <div className="manage-summary">
+                <strong>Cita #{managedAppointment.id}</strong>
+                <small>
+                  Estado: {managedAppointment.status} · Inicio:{' '}
+                  {formatSlotTime(managedAppointment.startsAt)}
+                </small>
+              </div>
+            ) : null}
+
+            {managedAppointment ? (
+              <div className="manage-actions">
+                <label className="select-field">
+                  <CalendarDots size={18} />
+                  <input
+                    type="date"
+                    value={manageDate}
+                    onChange={(event) => setManageDate(event.target.value)}
+                  />
+                </label>
+                <button type="button" className="ghost-btn" onClick={onSearchManageAvailability}>
+                  Buscar slots
+                </button>
+
+                {manageSlots.length > 0 ? (
+                  <div className="slots">
+                    {manageSlots.slice(0, 8).map((slot) => {
+                      const selectedCandidate = resolveSlotCandidate(
+                        slot,
+                        managedAppointment?.therapistId || '',
+                        null
+                      );
+                      const isSelected = manageSelectedSlot?.startsAt === slot.startsAt;
+
+                      return (
+                        <button
+                          key={`manage-${slot.startsAt}`}
+                          type="button"
+                          className={`slot-card ${isSelected ? 'is-selected' : ''}`}
+                          onClick={() =>
+                            setManageSelectedSlot({
+                              ...slot,
+                              selectedCandidate
+                            })
+                          }
+                        >
+                          <Clock size={16} />
+                          <strong>{formatSlotTime(slot.startsAt)}</strong>
+                          <small>{selectedCandidate?.therapistName || 'Disponible'}</small>
+                        </button>
+                      );
+                    })}
+                  </div>
+                ) : null}
+
+                <button type="button" className="primary-btn" onClick={onRescheduleAppointment}>
+                  {manageLoading ? 'Procesando...' : 'Reagendar'}
+                </button>
+
+                <input
+                  value={cancelReason}
+                  onChange={(event) => setCancelReason(event.target.value)}
+                  placeholder="Motivo de cancelación (opcional)"
+                />
+                <button type="button" className="ghost-btn" onClick={onCancelAppointment}>
+                  Cancelar cita
+                </button>
+              </div>
+            ) : null}
+
+            {manageError ? <p className="error-text">{manageError}</p> : null}
+            {manageSuccess ? <p className="success-text">{manageSuccess}</p> : null}
+          </section>
+        ) : null}
+
         <footer className="footer-actions">
           <a href={supportUrl} target="_blank" rel="noreferrer" className="guide-btn">
             Buscar guia
             <ArrowSquareOut size={16} />
           </a>
-          <button type="button" className="ghost-btn">
-            Gestionar mi cita
+          <button
+            type="button"
+            className="ghost-btn"
+            onClick={() => setManageOpen((prev) => !prev)}
+          >
+            {manageOpen ? 'Cerrar gestión' : 'Gestionar mi cita'}
           </button>
         </footer>
       </section>

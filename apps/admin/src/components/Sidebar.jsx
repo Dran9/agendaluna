@@ -16,7 +16,7 @@ const items = [
   { id: 'ajustes', label: 'Ajustes', icon: SlidersHorizontal }
 ];
 
-export function Sidebar({ theme, onToggleTheme }) {
+export function Sidebar({ theme, onToggleTheme, activeView, onNavigate }) {
   return (
     <aside className="sidebar">
       <div className="brand-slot" aria-label="Logo del centro">
@@ -27,14 +27,16 @@ export function Sidebar({ theme, onToggleTheme }) {
       <nav className="sidebar-nav" aria-label="Navegacion principal">
         {items.map((item, index) => {
           const Icon = item.icon;
+          const isActive = item.id === activeView;
           return (
             <button
               key={item.id}
               type="button"
-              className={`nav-item ${index === 0 ? 'is-active' : ''}`}
+              className={`nav-item ${isActive ? 'is-active' : ''}`}
               aria-label={item.label}
+              onClick={() => onNavigate(item.id)}
             >
-              <Icon size={22} weight={index === 0 ? 'fill' : 'regular'} />
+              <Icon size={22} weight={isActive ? 'fill' : 'regular'} />
               <span>{item.label}</span>
             </button>
           );

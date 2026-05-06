@@ -6,6 +6,11 @@ import { env } from '../utils/env.js';
 import { getPublicCatalog } from '../services/catalog.service.js';
 import { listAvailability } from '../services/availability.service.js';
 import { confirmPublicAppointment } from '../services/appointments.service.js';
+import {
+  cancelPublicAppointment,
+  createPublicManageToken,
+  reschedulePublicAppointment
+} from '../services/manageAppointment.service.js';
 import { asyncHandler } from '../utils/http.js';
 import { sendBookingMessage } from '../adapters/messaging/index.js';
 import { AppError, ValidationError } from '../services/errors.js';
@@ -78,6 +83,27 @@ const ConfirmSchema = z.object({
     fullName: z.string().min(2).max(140),
     whatsappPhone: z.string().min(7).max(40)
   })
+});
+
+const ManageTokenSchema = z.object({
+  centerId: z.coerce.number().int().positive().default(1),
+  appointmentId: z.coerce.number().int().positive(),
+  whatsappPhone: z.string().min(7).max(40)
+});
+
+const RescheduleSchema = z.object({
+  centerId: z.coerce.number().int().positive().default(1),
+  appointmentId: z.coerce.number().int().positive(),
+  manageToken: z.string().min(20),
+  startsAt: z.string().datetime({ offset: true }),
+  therapistId: z.coerce.number().int().positive().nullable().optional()
+});
+
+const CancelSchema = z.object({
+  centerId: z.coerce.number().int().positive().default(1),
+  appointmentId: z.coerce.number().int().positive(),
+  manageToken: z.string().min(20),
+  reason: z.string().max(400).optional()
 });
 
 const SupportSchema = z.object({
@@ -206,33 +232,48 @@ router.post(
 router.post(
   '/manage-token',
   asyncHandler(async (req, res) => {
-    res.status(501).json({
-      ok: false,
-      code: 'not_implemented',
-      message: 'Manage token flow will be implemented in Phase B.'
-    });
+    const input = ManageTokenSchema.parse(req.body || {});
+    const result = await createPublicManageToken(input);
+    res.json(result);
   })
 );
 
 router.post(
   '/reschedule',
   asyncHandler(async (req, res) => {
-    res.status(501).json({
-      ok: false,
-      code: 'not_implemented',
-      message: 'Reschedule flow will be implemented in Phase B.'
+    const input = RescheduleSchema.parse(req.body || {});
+    const result = await reschedulePublicAppointment({
+      centerId: input.centerId,
+      appointmentId: input.appointmentId,
+      manageToken: input.manageToken,
+      startsAt: input.startsAt,
+      therapistId: input.therapistId ?? null
     });
+
+    await sendBookingMessage({
+      kind: 'booking_rescheduled',
+      centerId: input.centerId,
+      appointment: result.appointment
+    });
+
+    res.json(result);
   })
 );
 
 router.post(
   '/cancel',
   asyncHandler(async (req, res) => {
-    res.status(501).json({
-      ok: false,
-      code: 'not_implemented',
-      message: 'Cancel flow will be implemented in Phase B.'
+    const input = CancelSchema.parse(req.body || {});
+    const result = await cancelPublicAppointment(input);
+
+    await sendBookingMessage({
+      kind: 'booking_cancelled',
+      centerId: input.centerId,
+      appointment: result.appointment,
+      reason: input.reason || null
     });
+
+    res.json(result);
   })
 );
 
