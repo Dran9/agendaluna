@@ -72,8 +72,8 @@ function shouldStartServer() {
 }
 
 if (shouldStartServer()) {
-  app.listen(env.PORT, () => {
+  app.listen(env.PORT, env.HOST, () => {
     // eslint-disable-next-line no-console
-    console.log(`Agenda Luna API running on port ${env.PORT}`);
+    console.log(`Agenda Luna API running on http://${env.HOST}:${env.PORT}`);
   });
 }
