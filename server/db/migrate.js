@@ -8,6 +8,67 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const migrationsDir = path.join(__dirname, 'migrations');
 
+function splitSqlStatements(sql) {
+  const statements = [];
+  let current = '';
+  let inSingle = false;
+  let inDouble = false;
+  let inBacktick = false;
+  let escaped = false;
+
+  for (let i = 0; i < sql.length; i += 1) {
+    const char = sql[i];
+
+    if (escaped) {
+      current += char;
+      escaped = false;
+      continue;
+    }
+
+    if (char === '\\') {
+      current += char;
+      escaped = true;
+      continue;
+    }
+
+    if (!inDouble && !inBacktick && char === "'") {
+      inSingle = !inSingle;
+      current += char;
+      continue;
+    }
+
+    if (!inSingle && !inBacktick && char === '"') {
+      inDouble = !inDouble;
+      current += char;
+      continue;
+    }
+
+    if (!inSingle && !inDouble && char === '`') {
+      inBacktick = !inBacktick;
+      current += char;
+      continue;
+    }
+
+    if (!inSingle && !inDouble && !inBacktick && char === ';') {
+      const statement = current.trim();
+      if (statement) {
+        statements.push(statement);
+      }
+      current = '';
+      continue;
+    }
+
+    current += char;
+  }
+
+  const trailing = current.trim();
+  if (trailing) {
+    statements.push(trailing);
+  }
+
+  return statements;
+}
+
 async function ensureMigrationsTable(connection) {
   await connection.query(`
     CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -41,7 +102,12 @@ async function run() {
     for (const fileName of pending) {
       const filePath = path.join(migrationsDir, fileName);
       const sql = await fs.readFile(filePath, 'utf8');
-      await connection.query(sql);
+      const statements = splitSqlStatements(sql);
+
+      for (const statement of statements) {
+        await connection.query(statement);
+      }
+
       await connection.query('INSERT INTO schema_migrations (file_name) VALUES (?)', [fileName]);
       // eslint-disable-next-line no-console
       console.log(`Applied migration: ${fileName}`);

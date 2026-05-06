@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import { getPool, withTransaction } from './pool.js';
 import { buildClaimMinutes } from '../services/claims.service.js';
+import { addMinutes, fromMySqlDateTime, toDateOnlyInAppTz, toMySqlDateTime } from '../utils/dates.js';
 
 const CENTER_SLUG = 'luna-mandala';
 const CENTER_NAME = 'Luna Mandala';
@@ -54,12 +55,6 @@ const CLIENT_SEEDS = [
 
 function pad(n) {
   return String(n).padStart(2, '0');
-}
-
-function asSqlDateTime(date) {
-  return `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(
-    date.getUTCDate()
-  )} ${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}:${pad(date.getUTCSeconds())}`;
 }
 
 function inClause(values) {
@@ -309,8 +304,8 @@ async function deletePreviousSeedAppointments(connection, centerId) {
 }
 
 async function createSeedAppointments(connection, centerId, serviceIds, therapistIds, roomIds, clientIds) {
-  const base = new Date();
-  base.setUTCHours(0, 0, 0, 0);
+  const today = toDateOnlyInAppTz(new Date());
+  const base = fromMySqlDateTime(`${today} 00:00:00`);
 
   const slots = [
     { dayOffset: 1, hour: 13, minute: 0 },
@@ -338,11 +333,12 @@ async function createSeedAppointments(connection, centerId, serviceIds, therapis
     );
 
     const service = serviceRows[0];
-    const startsAt = new Date(base);
-    startsAt.setUTCDate(startsAt.getUTCDate() + slot.dayOffset);
-    startsAt.setUTCHours(slot.hour, slot.minute, 0, 0);
-
-    const endsAt = new Date(startsAt.getTime() + service.duration_min * 60 * 1000);
+    const slotDay = new Date(base.getTime() + slot.dayOffset * 24 * 60 * 60 * 1000);
+    const slotDayString = toDateOnlyInAppTz(slotDay);
+    const startsAt = fromMySqlDateTime(
+      `${slotDayString} ${pad(slot.hour)}:${pad(slot.minute)}:00`
+    );
+    const endsAt = addMinutes(startsAt, Number(service.duration_min));
 
     const [appointmentResult] = await connection.query(
       `INSERT INTO appointments
@@ -354,8 +350,8 @@ async function createSeedAppointments(connection, centerId, serviceIds, therapis
         serviceId,
         therapistId,
         roomId,
-        asSqlDateTime(startsAt),
-        asSqlDateTime(endsAt),
+        toMySqlDateTime(startsAt),
+        toMySqlDateTime(endsAt),
         SEED_NOTES_MARKER
       ]
     );
@@ -365,7 +361,7 @@ async function createSeedAppointments(connection, centerId, serviceIds, therapis
     const minutes = buildClaimMinutes(startsAt, endsAt);
 
     for (const minute of minutes) {
-      const claimTime = asSqlDateTime(minute);
+      const claimTime = toMySqlDateTime(minute);
       await connection.query(
         `INSERT INTO appointment_resource_claims
           (center_id, appointment_id, resource_type, resource_id, claim_time)

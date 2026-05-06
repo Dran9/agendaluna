@@ -1,20 +1,18 @@
 import { ConflictError, ValidationError } from './errors.js';
+import { fromMySqlDateTime, toMySqlDateTime } from '../utils/dates.js';
 
 const MINUTE_MS = 60 * 1000;
 
 function floorToMinute(input) {
-  const value = new Date(input);
-
-  if (Number.isNaN(value.getTime())) {
+  let value;
+  try {
+    value = fromMySqlDateTime(input);
+  } catch {
     throw new ValidationError('Invalid datetime format');
   }
 
   value.setSeconds(0, 0);
   return value;
-}
-
-function toMySqlDateTime(date) {
-  return date.toISOString().slice(0, 19).replace('T', ' ');
 }
 
 export function buildClaimMinutes(startsAtInput, endsAtInput) {

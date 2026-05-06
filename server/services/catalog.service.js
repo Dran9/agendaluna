@@ -1,4 +1,4 @@
-import { mockCatalog } from './mockCatalog.service.js';
+import { ValidationError } from './errors.js';
 
 export async function getPublicCatalog(connection, centerId = 1) {
   const [centerRows] = await connection.query(
@@ -12,7 +12,7 @@ export async function getPublicCatalog(connection, centerId = 1) {
   );
 
   if (!centerRows[0]) {
-    return mockCatalog;
+    throw new ValidationError('Center not found or inactive');
   }
 
   const [serviceRows] = await connection.query(

@@ -155,6 +155,11 @@ body,
   background: var(--surface-muted);
 }
 
+.service-price {
+  color: var(--muted);
+  font-size: 12px;
+}
+
 .primary-btn,
 .guide-btn,
 .ghost-btn {
@@ -192,22 +197,69 @@ body,
   gap: 8px;
 }
 
-.slots article {
+.slot-card {
   border: 1px solid var(--border);
   border-radius: 12px;
   background: var(--surface-muted);
   min-height: 72px;
   padding: 8px;
+  text-align: left;
   display: flex;
   flex-direction: column;
   gap: 4px;
+  color: var(--ink);
 }
 
-.slots span {
+.slot-card.is-selected {
+  border-color: var(--primary);
+  box-shadow: var(--shadow-focus);
+  background: color-mix(in srgb, var(--surface) 74%, var(--primary) 26%);
+}
+
+.slot-card strong {
   font-weight: 600;
 }
 
-.slots small {
+.slot-card small {
+  color: var(--muted);
+}
+
+.warning-strip {
+  border: 1px solid color-mix(in srgb, var(--warning) 35%, var(--border));
+  background: color-mix(in srgb, var(--surface) 76%, var(--warning) 24%);
+  border-radius: 12px;
+  color: var(--ink);
+  font-size: 12px;
+  line-height: 1.4;
+  padding: 10px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.error-text {
+  margin: 2px 0 0;
+  color: #f87171;
+  font-size: 12px;
+}
+
+.success-panel {
+  border: 1px solid color-mix(in srgb, var(--success) 35%, var(--border));
+  background: color-mix(in srgb, var(--surface) 75%, var(--success) 25%);
+  border-radius: 12px;
+  padding: 12px;
+  display: flex;
+  gap: 8px;
+}
+
+.success-panel strong {
+  display: block;
+  font-size: 14px;
+}
+
+.success-panel p {
+  margin: 4px 0 0;
+  font-size: 12px;
   color: var(--muted);
 }
 

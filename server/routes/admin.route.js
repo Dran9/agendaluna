@@ -3,6 +3,8 @@ import { z } from 'zod';
 import { getPool } from '../db/pool.js';
 import { authRequired, signAdminToken } from '../utils/jwt.js';
 import { asyncHandler } from '../utils/http.js';
+import { env } from '../utils/env.js';
+import { AppError } from '../services/errors.js';
 
 const router = Router();
 const pool = getPool();
@@ -15,6 +17,10 @@ const DevTokenSchema = z.object({
 router.post(
   '/auth/dev-token',
   asyncHandler(async (req, res) => {
+    if (env.NODE_ENV !== 'development') {
+      throw new AppError('Dev token endpoint is disabled outside development', 403, 'forbidden');
+    }
+
     const input = DevTokenSchema.parse(req.body || {});
 
     const token = signAdminToken({

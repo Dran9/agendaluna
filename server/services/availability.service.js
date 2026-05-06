@@ -1,27 +1,31 @@
+import { env } from '../utils/env.js';
+import {
+  addMinutes,
+  fromMySqlDateTime,
+  parseDateOnlyInAppTz,
+  toDateOnlyInAppTz,
+  toMySqlDateTime
+} from '../utils/dates.js';
 import { ValidationError } from './errors.js';
 import { chooseRoundRobinTherapist, getRoundRobinState } from './roundRobin.service.js';
 
 const DEFAULT_SLOT_STEP_MIN = 30;
 
-function fromSqlDateTime(value) {
-  if (value instanceof Date) {
-    return value;
-  }
-  return new Date(String(value).replace(' ', 'T'));
+function pad(num) {
+  return String(num).padStart(2, '0');
 }
 
-function toSqlDateTime(value) {
-  const date = value instanceof Date ? value : new Date(value);
-  return date.toISOString().slice(0, 19).replace('T', ' ');
+function getMinutesInAppTz(date) {
+  const sqlDateTime = toMySqlDateTime(date);
+  const hour = Number(sqlDateTime.slice(11, 13));
+  const minute = Number(sqlDateTime.slice(14, 16));
+  return hour * 60 + minute;
 }
 
-function toDateOnlyString(value) {
-  const date = value instanceof Date ? value : new Date(value);
-  return date.toISOString().slice(0, 10);
-}
-
-function minutesOfDay(date) {
-  return date.getHours() * 60 + date.getMinutes();
+function getWeekdayInAppTz(date) {
+  const dayString = toDateOnlyInAppTz(date);
+  const noon = fromMySqlDateTime(`${dayString} 12:00:00`);
+  return noon.getUTCDay();
 }
 
 function parseTimeToMinutes(sqlTime) {
@@ -31,6 +35,10 @@ function parseTimeToMinutes(sqlTime) {
 
 function hasWindowCoverage(windows, startMin, endMin) {
   if (!windows || windows.length === 0) {
+    if (!env.ENABLE_DEMO_SCHEDULE_FALLBACK) {
+      return false;
+    }
+
     return startMin >= 9 * 60 && endMin <= 18 * 60;
   }
 
@@ -161,8 +169,8 @@ async function getResourceBlocks(connection, centerId, resourceType, resourceIds
       centerId,
       resourceType,
       ...inClause.params,
-      toSqlDateTime(slotEnd),
-      toSqlDateTime(slotStart)
+      toMySqlDateTime(slotEnd),
+      toMySqlDateTime(slotStart)
     ]
   );
 
@@ -188,8 +196,8 @@ async function getClaimConflicts(connection, centerId, resourceType, resourceIds
       centerId,
       resourceType,
       ...inClause.params,
-      toSqlDateTime(slotStart),
-      toSqlDateTime(slotEnd)
+      toMySqlDateTime(slotStart),
+      toMySqlDateTime(slotEnd)
     ]
   );
 
@@ -211,7 +219,7 @@ async function getAppointmentConflicts(connection, centerId, idColumn, resourceI
        AND starts_at < ?
        AND ends_at > ?
      GROUP BY ${idColumn}`,
-    [centerId, ...inClause.params, toSqlDateTime(slotEnd), toSqlDateTime(slotStart)]
+    [centerId, ...inClause.params, toMySqlDateTime(slotEnd), toMySqlDateTime(slotStart)]
   );
 
   return arrayToMap(rows, 'resource_id');
@@ -229,16 +237,13 @@ export async function findSlotCandidates(connection, {
     throw new ValidationError('Service is inactive or does not exist');
   }
 
-  const effectiveDuration = durationMin || service.duration_min;
-  const start = new Date(slotStart);
-  if (Number.isNaN(start.getTime())) {
-    throw new ValidationError('Invalid slot datetime');
-  }
+  const effectiveDuration = Number(durationMin || service.duration_min);
+  const start = fromMySqlDateTime(slotStart);
+  const end = addMinutes(start, effectiveDuration);
 
-  const end = new Date(start.getTime() + effectiveDuration * 60 * 1000);
-  const startMin = minutesOfDay(start);
-  const endMin = minutesOfDay(end);
-  const weekday = start.getDay();
+  const startMin = getMinutesInAppTz(start);
+  const endMin = getMinutesInAppTz(end);
+  const weekday = getWeekdayInAppTz(start);
 
   const therapists = await getTherapistsForService(connection, centerId, serviceId, therapistId);
   const rooms = await getRoomsForService(connection, centerId, serviceId);
@@ -317,12 +322,14 @@ export async function findSlotCandidates(connection, {
 }
 
 async function getMonthlyLoads(connection, centerId, serviceId, referenceDate) {
-  const monthStart = new Date(referenceDate);
-  monthStart.setDate(1);
-  monthStart.setHours(0, 0, 0, 0);
+  const referenceSql = toMySqlDateTime(referenceDate);
+  const year = Number(referenceSql.slice(0, 4));
+  const month = Number(referenceSql.slice(5, 7));
 
-  const nextMonth = new Date(monthStart);
-  nextMonth.setMonth(nextMonth.getMonth() + 1);
+  const monthStartSql = `${year}-${pad(month)}-01 00:00:00`;
+  const nextYear = month === 12 ? year + 1 : year;
+  const nextMonth = month === 12 ? 1 : month + 1;
+  const nextMonthStartSql = `${nextYear}-${pad(nextMonth)}-01 00:00:00`;
 
   const [rows] = await connection.query(
     `SELECT therapist_id, COUNT(*) AS load_count
@@ -333,7 +340,7 @@ async function getMonthlyLoads(connection, centerId, serviceId, referenceDate) {
        AND starts_at >= ?
        AND starts_at < ?
      GROUP BY therapist_id`,
-    [centerId, serviceId, toSqlDateTime(monthStart), toSqlDateTime(nextMonth)]
+    [centerId, serviceId, monthStartSql, nextMonthStartSql]
   );
 
   return rows.reduce((acc, row) => {
@@ -355,9 +362,12 @@ export async function listAvailability(connection, {
     throw new ValidationError('Service is inactive or does not exist');
   }
 
-  const dayString = toDateOnlyString(date);
-  const dayStart = new Date(`${dayString}T08:00:00`);
-  const dayEnd = new Date(`${dayString}T20:00:00`);
+  const dayString = /^\d{4}-\d{2}-\d{2}$/.test(String(date))
+    ? String(date)
+    : toDateOnlyInAppTz(fromMySqlDateTime(date));
+
+  const dayStart = parseDateOnlyInAppTz(dayString, '08:00:00');
+  const dayEnd = parseDateOnlyInAppTz(dayString, '20:00:00');
 
   const slotEntries = [];
   for (
@@ -428,8 +438,8 @@ export async function listAvailability(connection, {
     service: {
       id: serviceRow.id,
       name: serviceRow.name,
-      durationMin: serviceRow.duration_min,
-      basePriceCents: serviceRow.base_price_cents,
+      durationMin: Number(serviceRow.duration_min),
+      basePriceCents: Number(serviceRow.base_price_cents),
       currency: serviceRow.currency
     },
     recommendation,

@@ -2,16 +2,58 @@ import crypto from 'node:crypto';
 import { Router } from 'express';
 import { z } from 'zod';
 import { getPool } from '../db/pool.js';
+import { env } from '../utils/env.js';
 import { getPublicCatalog } from '../services/catalog.service.js';
 import { listAvailability } from '../services/availability.service.js';
 import { confirmPublicAppointment } from '../services/appointments.service.js';
 import { asyncHandler } from '../utils/http.js';
 import { sendBookingMessage } from '../adapters/messaging/index.js';
-import { ValidationError } from '../services/errors.js';
+import { AppError, ValidationError } from '../services/errors.js';
 import { buildMockAvailability, mockCatalog } from '../services/mockCatalog.service.js';
 
 const router = Router();
 const pool = getPool();
+
+function isDatabaseError(error) {
+  if (!error) {
+    return false;
+  }
+
+  if (typeof error.code === 'string' && error.code.startsWith('ER_')) {
+    return true;
+  }
+
+  if (typeof error.errno === 'number') {
+    return true;
+  }
+
+  const message = String(error.message || '').toLowerCase();
+  return (
+    message.includes('connection') ||
+    message.includes('econn') ||
+    message.includes('database') ||
+    message.includes('pool') ||
+    message.includes('query')
+  );
+}
+
+function canUseMockFallback() {
+  return env.NODE_ENV === 'development' && env.ENABLE_MOCK_FALLBACK;
+}
+
+function handleDatabaseFailure(scope, error) {
+  if (canUseMockFallback()) {
+    // eslint-disable-next-line no-console
+    console.warn(`[MOCK_FALLBACK_ENABLED] ${scope}: ${error.message}`);
+    return null;
+  }
+
+  throw new AppError(
+    `Database unavailable while processing ${scope}. Enable ENABLE_MOCK_FALLBACK=true only for local development if needed.`,
+    503,
+    'db_unavailable'
+  );
+}
 
 const AvailabilitySchema = z.object({
   centerId: z.coerce.number().int().positive().default(1),
@@ -49,15 +91,20 @@ router.get(
   '/catalog',
   asyncHandler(async (req, res) => {
     const centerId = Number(req.query.centerId || 1);
-    let catalog = mockCatalog;
-
+    let usedMockFallback = false;
+    let catalog;
     try {
       catalog = await getPublicCatalog(pool, centerId);
-    } catch {
+    } catch (error) {
+      if (!isDatabaseError(error)) {
+        throw error;
+      }
+      handleDatabaseFailure('public catalog', error);
       catalog = mockCatalog;
+      usedMockFallback = true;
     }
 
-    res.json({ ok: true, ...catalog });
+    res.json({ ok: true, mockFallbackUsed: usedMockFallback, ...catalog });
   })
 );
 
@@ -65,6 +112,7 @@ router.post(
   '/availability',
   asyncHandler(async (req, res) => {
     const input = AvailabilitySchema.parse(req.body);
+    let usedMockFallback = false;
     let availability;
 
     try {
@@ -74,15 +122,20 @@ router.post(
         therapistId: input.therapistId ?? null,
         date: input.date
       });
-    } catch {
+    } catch (error) {
+      if (!isDatabaseError(error)) {
+        throw error;
+      }
+      handleDatabaseFailure('public availability', error);
       availability = buildMockAvailability({
         serviceId: input.serviceId,
         date: input.date,
         therapistId: input.therapistId ?? null
       });
+      usedMockFallback = true;
     }
 
-    res.json({ ok: true, ...availability });
+    res.json({ ok: true, mockFallbackUsed: usedMockFallback, ...availability });
   })
 );
 
@@ -187,10 +240,14 @@ router.post(
   '/support-request',
   asyncHandler(async (req, res) => {
     const input = SupportSchema.parse(req.body);
-    let catalog = mockCatalog;
+    let catalog;
     try {
       catalog = await getPublicCatalog(pool, input.centerId);
-    } catch {
+    } catch (error) {
+      if (!isDatabaseError(error)) {
+        throw error;
+      }
+      handleDatabaseFailure('support request catalog', error);
       catalog = mockCatalog;
     }
 

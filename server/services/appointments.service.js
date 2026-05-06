@@ -5,14 +5,7 @@ import { createClaimsTx } from './claims.service.js';
 import { ValidationError, ConflictError } from './errors.js';
 import { advanceRoundRobinTx, chooseRoundRobinTherapist, getRoundRobinState } from './roundRobin.service.js';
 import { withLock } from './locks.service.js';
-
-function asSqlDateTime(value) {
-  const date = value instanceof Date ? value : new Date(value);
-  if (Number.isNaN(date.getTime())) {
-    throw new ValidationError('Invalid datetime');
-  }
-  return date.toISOString().slice(0, 19).replace('T', ' ');
-}
+import { fromMySqlDateTime, toDateOnlyInAppTz, toMySqlDateTime } from '../utils/dates.js';
 
 function hashPayload(payload) {
   const stable = JSON.stringify(payload, Object.keys(payload).sort());
@@ -20,7 +13,11 @@ function hashPayload(payload) {
 }
 
 function toDateOnly(value) {
-  return asSqlDateTime(value).slice(0, 10);
+  try {
+    return toDateOnlyInAppTz(fromMySqlDateTime(value));
+  } catch {
+    throw new ValidationError('Invalid datetime');
+  }
 }
 
 async function findService(connection, centerId, serviceId) {
@@ -145,7 +142,7 @@ export async function confirmPublicAppointment(payload) {
     }
 
     const service = await findService(connection, centerId, serviceId);
-    const lockKey = `luna:book:${centerId}:${serviceId}:${asSqlDateTime(startsAt).slice(0, 16)}`;
+    const lockKey = `luna:book:${centerId}:${serviceId}:${toMySqlDateTime(fromMySqlDateTime(startsAt)).slice(0, 16)}`;
 
     return withLock(connection, lockKey, async () => {
       const availability = await listAvailability(connection, {
@@ -156,9 +153,9 @@ export async function confirmPublicAppointment(payload) {
         maxSlots: 40
       });
 
-      const requestedMinute = asSqlDateTime(startsAt).slice(0, 16);
+      const requestedMinute = toMySqlDateTime(fromMySqlDateTime(startsAt)).slice(0, 16);
       const matchingSlot = availability.slots.find(
-        (slot) => asSqlDateTime(slot.startsAt).slice(0, 16) === requestedMinute
+        (slot) => toMySqlDateTime(fromMySqlDateTime(slot.startsAt)).slice(0, 16) === requestedMinute
       );
 
       if (!matchingSlot) {
@@ -193,7 +190,7 @@ export async function confirmPublicAppointment(payload) {
         whatsappPhone: client.whatsappPhone
       });
 
-      const slotStart = new Date(startsAt);
+      const slotStart = fromMySqlDateTime(startsAt);
       const slotEnd = new Date(slotStart.getTime() + service.duration_min * 60 * 1000);
 
       const [appointmentResult] = await connection.query(
@@ -206,8 +203,8 @@ export async function confirmPublicAppointment(payload) {
           serviceId,
           candidate.therapistId,
           candidate.roomId,
-          asSqlDateTime(slotStart),
-          asSqlDateTime(slotEnd)
+          toMySqlDateTime(slotStart),
+          toMySqlDateTime(slotEnd)
         ]
       );
 
@@ -245,8 +242,8 @@ export async function confirmPublicAppointment(payload) {
           JSON.stringify({
             therapistId: candidate.therapistId,
             roomId: candidate.roomId,
-            startsAt: asSqlDateTime(slotStart),
-            endsAt: asSqlDateTime(slotEnd)
+            startsAt: toMySqlDateTime(slotStart),
+            endsAt: toMySqlDateTime(slotEnd)
           })
         ]
       );

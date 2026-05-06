@@ -30,7 +30,7 @@ export function getPool() {
   });
 
   pool.on('connection', (connection) => {
-    applyConnectionTimezone(connection).catch(() => {
+    connection.query('SET time_zone = ?', [env.DB_TIMEZONE], () => {
       // Ignore init failures; next query will return an explicit DB error.
     });
   });

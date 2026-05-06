@@ -48,9 +48,9 @@ export function buildMockAvailability({ serviceId, date, therapistId = null }) {
 
   const firstTherapist = therapistList[0] || mockCatalog.therapists[0];
   const starts = [
-    `${date}T09:00:00.000Z`,
-    `${date}T10:30:00.000Z`,
-    `${date}T12:00:00.000Z`
+    `${date}T09:00:00-04:00`,
+    `${date}T10:30:00-04:00`,
+    `${date}T12:00:00-04:00`
   ];
 
   return {
@@ -64,9 +64,7 @@ export function buildMockAvailability({ serviceId, date, therapistId = null }) {
       : null,
     slots: starts.map((startsAt, index) => ({
       startsAt,
-      endsAt: new Date(
-        new Date(startsAt).getTime() + service.durationMin * 60 * 1000
-      ).toISOString(),
+      endsAt: new Date(new Date(startsAt).getTime() + service.durationMin * 60 * 1000).toISOString(),
       therapists: therapistList.map((therapist) => ({
         therapistId: therapist.id,
         therapistName: therapist.fullName,
