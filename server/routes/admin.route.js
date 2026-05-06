@@ -4,9 +4,18 @@ import { getPool, withTransaction } from '../db/pool.js';
 import { authRequired, signAdminToken } from '../utils/jwt.js';
 import { asyncHandler } from '../utils/http.js';
 import { env } from '../utils/env.js';
-import { AppError, ValidationError } from '../services/errors.js';
+import { AppError, ConflictError, ValidationError } from '../services/errors.js';
 import { analyzePaymentEvidence } from '../services/paymentsReview.service.js';
-import { toMySqlDateTime } from '../utils/dates.js';
+import {
+  addMinutes,
+  fromMySqlDateTime,
+  toDateOnlyInAppTz,
+  toMySqlDateTime
+} from '../utils/dates.js';
+import { listAvailability } from '../services/availability.service.js';
+import { createClaimsTx, releaseClaimsTx } from '../services/claims.service.js';
+import { advanceRoundRobinTx, chooseRoundRobinTherapist, getRoundRobinState } from '../services/roundRobin.service.js';
+import { withLock } from '../services/locks.service.js';
 
 const router = Router();
 const pool = getPool();
@@ -81,11 +90,267 @@ const TelegramLinkSchema = z.object({
   telegramUsername: z.string().max(120).optional().or(z.literal(''))
 });
 
+const CreateTherapistSchema = z.object({
+  fullName: z.string().min(2).max(140),
+  bioShort: z.string().max(255).optional().or(z.literal('')),
+  phone: z.string().max(40).optional().or(z.literal('')),
+  email: z.string().email().max(190).optional().or(z.literal('')),
+  commissionPct: z.coerce.number().min(0).max(100),
+  isActive: z.boolean().optional().default(true)
+});
+
+const UpdateTherapistSchema = z
+  .object({
+    fullName: z.string().min(2).max(140).optional(),
+    bioShort: z.string().max(255).optional().or(z.literal('')),
+    phone: z.string().max(40).optional().or(z.literal('')),
+    email: z.string().email().max(190).optional().or(z.literal('')),
+    commissionPct: z.coerce.number().min(0).max(100).optional(),
+    isActive: z.boolean().optional()
+  })
+  .refine((payload) => Object.keys(payload).length > 0, {
+    message: 'At least one field is required'
+  });
+
+const TherapistServicesSchema = z.object({
+  serviceIds: z.array(z.coerce.number().int().positive()).max(200).default([])
+});
+
+const ScheduleEntrySchema = z.object({
+  weekday: z.coerce.number().int().min(0).max(6),
+  startTime: z.string().regex(/^\d{2}:\d{2}(:\d{2})?$/),
+  endTime: z.string().regex(/^\d{2}:\d{2}(:\d{2})?$/),
+  isActive: z.boolean().optional().default(true)
+});
+
+const UpdateTherapistScheduleSchema = z.object({
+  entries: z.array(ScheduleEntrySchema).max(35)
+});
+
+const CreateServiceSchema = z.object({
+  name: z.string().min(2).max(140),
+  description: z.string().max(4000).optional().or(z.literal('')),
+  durationMin: z.coerce.number().int().min(15).max(600),
+  basePriceCents: z.coerce.number().int().min(0).max(5_000_000_000),
+  currency: z.string().length(3),
+  isActive: z.boolean().optional().default(true)
+});
+
+const UpdateServiceSchema = z
+  .object({
+    name: z.string().min(2).max(140).optional(),
+    description: z.string().max(4000).optional().or(z.literal('')),
+    durationMin: z.coerce.number().int().min(15).max(600).optional(),
+    basePriceCents: z.coerce.number().int().min(0).max(5_000_000_000).optional(),
+    currency: z.string().length(3).optional(),
+    isActive: z.boolean().optional()
+  })
+  .refine((payload) => Object.keys(payload).length > 0, {
+    message: 'At least one field is required'
+  });
+
+const CreateRoomSchema = z.object({
+  name: z.string().min(2).max(120),
+  capacity: z.coerce.number().int().min(1).max(100),
+  isActive: z.boolean().optional().default(true)
+});
+
+const UpdateRoomSchema = z
+  .object({
+    name: z.string().min(2).max(120).optional(),
+    capacity: z.coerce.number().int().min(1).max(100).optional(),
+    isActive: z.boolean().optional()
+  })
+  .refine((payload) => Object.keys(payload).length > 0, {
+    message: 'At least one field is required'
+  });
+
+const AdminAvailabilitySchema = z.object({
+  serviceId: z.coerce.number().int().positive(),
+  date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  therapistId: z.coerce.number().int().positive().nullable().optional()
+});
+
+const NewAppointmentClientSchema = z.object({
+  fullName: z.string().min(2).max(140),
+  whatsappPhone: z.string().min(7).max(40),
+  email: z.string().email().max(190).optional().or(z.literal('')),
+  notes: z.string().max(3000).optional().or(z.literal(''))
+});
+
+const CreateAdminAppointmentSchema = z
+  .object({
+    clientId: z.coerce.number().int().positive().optional(),
+    client: NewAppointmentClientSchema.optional(),
+    serviceId: z.coerce.number().int().positive(),
+    therapistId: z.coerce.number().int().positive().nullable().optional(),
+    startsAt: z.string().datetime({ offset: true }),
+    note: z.string().max(3000).optional().or(z.literal(''))
+  })
+  .refine((payload) => Boolean(payload.clientId || payload.client), {
+    message: 'Provide clientId or client payload'
+  });
+
+const UpdateAppointmentStatusSchema = z.object({
+  status: z.enum(['confirmed', 'completed', 'cancelled', 'no_show']),
+  note: z.string().max(500).optional().or(z.literal(''))
+});
+
+const RescheduleAppointmentSchema = z.object({
+  startsAt: z.string().datetime({ offset: true }),
+  therapistId: z.coerce.number().int().positive().nullable().optional(),
+  roomId: z.coerce.number().int().positive().nullable().optional(),
+  note: z.string().max(500).optional().or(z.literal(''))
+});
+
 function toNullable(value) {
   if (value === undefined || value === null || value === '') {
     return null;
   }
   return value;
+}
+
+function parseOptionalJson(value) {
+  if (!value) {
+    return null;
+  }
+
+  if (typeof value === 'string') {
+    try {
+      return JSON.parse(value);
+    } catch {
+      return { raw: value };
+    }
+  }
+
+  return value;
+}
+
+function toComparableMinute(value) {
+  return toMySqlDateTime(fromMySqlDateTime(value)).slice(0, 16);
+}
+
+function normalizeTimeInput(value) {
+  const trimmed = String(value || '').trim();
+  if (/^\d{2}:\d{2}$/.test(trimmed)) {
+    return `${trimmed}:00`;
+  }
+  return trimmed;
+}
+
+function timeToMinutes(value) {
+  const normalized = normalizeTimeInput(value);
+  const [hourPart, minutePart] = normalized.split(':');
+  return Number(hourPart) * 60 + Number(minutePart);
+}
+
+function normalizeScheduleEntries(entries) {
+  const normalized = entries.map((entry) => ({
+    weekday: Number(entry.weekday),
+    startTime: normalizeTimeInput(entry.startTime),
+    endTime: normalizeTimeInput(entry.endTime),
+    isActive: Boolean(entry.isActive)
+  }));
+
+  for (const entry of normalized) {
+    if (timeToMinutes(entry.endTime) <= timeToMinutes(entry.startTime)) {
+      throw new ValidationError('Schedule endTime must be after startTime');
+    }
+  }
+
+  return normalized;
+}
+
+function pickAdminCandidate(slot, { therapistId = null, roomId = null } = {}) {
+  if (!slot || !Array.isArray(slot.candidates) || slot.candidates.length === 0) {
+    return null;
+  }
+
+  let candidates = slot.candidates;
+  if (therapistId !== null) {
+    candidates = candidates.filter((candidate) => Number(candidate.therapistId) === Number(therapistId));
+  }
+  if (roomId !== null) {
+    candidates = candidates.filter((candidate) => Number(candidate.roomId) === Number(roomId));
+  }
+  return candidates[0] || null;
+}
+
+async function getAppointmentRow(connection, centerId, appointmentId, { forUpdate = false } = {}) {
+  const [rows] = await connection.query(
+    `SELECT
+       a.id,
+       a.center_id,
+       a.client_id,
+       a.service_id,
+       a.therapist_id,
+       a.room_id,
+       a.starts_at,
+       a.ends_at,
+       a.status,
+       a.source,
+       a.payment_status,
+       a.notes,
+       c.full_name AS client_name,
+       c.whatsapp_phone AS client_whatsapp,
+       c.email AS client_email,
+       s.name AS service_name,
+       s.duration_min,
+       s.base_price_cents,
+       s.currency,
+       t.full_name AS therapist_name,
+       r.name AS room_name
+     FROM appointments a
+     JOIN clients c ON c.id = a.client_id
+     JOIN services s ON s.id = a.service_id
+     JOIN therapists t ON t.id = a.therapist_id
+     JOIN rooms r ON r.id = a.room_id
+     WHERE a.center_id = ?
+       AND a.id = ?
+     LIMIT 1
+     ${forUpdate ? 'FOR UPDATE' : ''}`,
+    [centerId, appointmentId]
+  );
+
+  return rows[0] || null;
+}
+
+function serializeAppointmentRow(row) {
+  if (!row) {
+    return null;
+  }
+
+  return {
+    id: row.id,
+    centerId: row.center_id,
+    client: {
+      id: row.client_id,
+      fullName: row.client_name,
+      whatsappPhone: row.client_whatsapp,
+      email: row.client_email
+    },
+    service: {
+      id: row.service_id,
+      name: row.service_name,
+      durationMin: Number(row.duration_min),
+      basePriceCents: Number(row.base_price_cents || 0),
+      currency: row.currency
+    },
+    therapist: {
+      id: row.therapist_id,
+      fullName: row.therapist_name
+    },
+    room: {
+      id: row.room_id,
+      name: row.room_name
+    },
+    startsAt: row.starts_at,
+    endsAt: row.ends_at,
+    status: row.status,
+    source: row.source,
+    paymentStatus: row.payment_status,
+    notes: row.notes
+  };
 }
 
 function pad(value) {
@@ -628,6 +893,1134 @@ router.get(
         };
       })
     });
+  })
+);
+
+router.post(
+  '/therapists',
+  asyncHandler(async (req, res) => {
+    const centerId = Number(req.user.centerId || 1);
+    const input = CreateTherapistSchema.parse(req.body || {});
+
+    const [insert] = await pool.query(
+      `INSERT INTO therapists
+        (center_id, full_name, bio_short, phone, email, commission_pct, is_active)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [
+        centerId,
+        input.fullName,
+        toNullable(input.bioShort),
+        toNullable(input.phone),
+        toNullable(input.email),
+        input.commissionPct,
+        input.isActive ? 1 : 0
+      ]
+    );
+
+    const [rows] = await pool.query(
+      `SELECT id, full_name, bio_short, phone, email, commission_pct, is_active
+       FROM therapists
+       WHERE center_id = ? AND id = ?
+       LIMIT 1`,
+      [centerId, insert.insertId]
+    );
+
+    res.status(201).json({
+      ok: true,
+      therapist: {
+        id: rows[0].id,
+        fullName: rows[0].full_name,
+        bioShort: rows[0].bio_short,
+        phone: rows[0].phone,
+        email: rows[0].email,
+        commissionPct: Number(rows[0].commission_pct),
+        isActive: Boolean(rows[0].is_active)
+      }
+    });
+  })
+);
+
+router.patch(
+  '/therapists/:id',
+  asyncHandler(async (req, res) => {
+    const centerId = Number(req.user.centerId || 1);
+    const therapistId = Number(req.params.id);
+    if (!Number.isFinite(therapistId) || therapistId <= 0) {
+      throw new ValidationError('Invalid therapist id');
+    }
+
+    const input = UpdateTherapistSchema.parse(req.body || {});
+    const updates = [];
+    const params = [];
+
+    if (input.fullName !== undefined) {
+      updates.push('full_name = ?');
+      params.push(input.fullName);
+    }
+
+    if (input.bioShort !== undefined) {
+      updates.push('bio_short = ?');
+      params.push(toNullable(input.bioShort));
+    }
+
+    if (input.phone !== undefined) {
+      updates.push('phone = ?');
+      params.push(toNullable(input.phone));
+    }
+
+    if (input.email !== undefined) {
+      updates.push('email = ?');
+      params.push(toNullable(input.email));
+    }
+
+    if (input.commissionPct !== undefined) {
+      updates.push('commission_pct = ?');
+      params.push(input.commissionPct);
+    }
+
+    if (input.isActive !== undefined) {
+      updates.push('is_active = ?');
+      params.push(input.isActive ? 1 : 0);
+    }
+
+    params.push(therapistId, centerId);
+
+    const [result] = await pool.query(
+      `UPDATE therapists
+       SET ${updates.join(', ')}, updated_at = CURRENT_TIMESTAMP
+       WHERE id = ? AND center_id = ?`,
+      params
+    );
+
+    if (!result.affectedRows) {
+      throw new AppError('Therapist not found', 404, 'not_found');
+    }
+
+    const [rows] = await pool.query(
+      `SELECT id, full_name, bio_short, phone, email, commission_pct, is_active
+       FROM therapists
+       WHERE center_id = ? AND id = ?
+       LIMIT 1`,
+      [centerId, therapistId]
+    );
+
+    res.json({
+      ok: true,
+      therapist: {
+        id: rows[0].id,
+        fullName: rows[0].full_name,
+        bioShort: rows[0].bio_short,
+        phone: rows[0].phone,
+        email: rows[0].email,
+        commissionPct: Number(rows[0].commission_pct),
+        isActive: Boolean(rows[0].is_active)
+      }
+    });
+  })
+);
+
+router.put(
+  '/therapists/:id/services',
+  asyncHandler(async (req, res) => {
+    const centerId = Number(req.user.centerId || 1);
+    const therapistId = Number(req.params.id);
+    if (!Number.isFinite(therapistId) || therapistId <= 0) {
+      throw new ValidationError('Invalid therapist id');
+    }
+
+    const input = TherapistServicesSchema.parse(req.body || {});
+    const dedupedServiceIds = [...new Set(input.serviceIds.map((serviceId) => Number(serviceId)))];
+
+    const response = await withTransaction(async (connection) => {
+      const [therapistRows] = await connection.query(
+        `SELECT id
+         FROM therapists
+         WHERE center_id = ? AND id = ?
+         LIMIT 1
+         FOR UPDATE`,
+        [centerId, therapistId]
+      );
+
+      if (!therapistRows[0]) {
+        throw new AppError('Therapist not found', 404, 'not_found');
+      }
+
+      if (dedupedServiceIds.length > 0) {
+        const [serviceRows] = await connection.query(
+          `SELECT id
+           FROM services
+           WHERE center_id = ?
+             AND id IN (${dedupedServiceIds.map(() => '?').join(',')})`,
+          [centerId, ...dedupedServiceIds]
+        );
+
+        if (serviceRows.length !== dedupedServiceIds.length) {
+          throw new ValidationError('Some services do not exist for this center');
+        }
+      }
+
+      await connection.query(
+        `UPDATE therapist_services
+         SET is_active = 0
+         WHERE center_id = ?
+           AND therapist_id = ?`,
+        [centerId, therapistId]
+      );
+
+      for (const [index, serviceId] of dedupedServiceIds.entries()) {
+        await connection.query(
+          `INSERT INTO therapist_services
+            (center_id, therapist_id, service_id, round_robin_order, is_active)
+           VALUES (?, ?, ?, ?, 1)
+           ON DUPLICATE KEY UPDATE
+            round_robin_order = VALUES(round_robin_order),
+            is_active = 1`,
+          [centerId, therapistId, serviceId, index + 1]
+        );
+      }
+
+      await connection.query(
+        `INSERT INTO audit_logs
+          (center_id, actor_type, actor_id, entity_type, entity_id, action, metadata_json)
+         VALUES (?, 'admin', ?, 'therapist', ?, 'therapist_services_updated', ?)`,
+        [
+          centerId,
+          req.user.sub ? Number(req.user.id || 0) || null : null,
+          therapistId,
+          JSON.stringify({
+            serviceIds: dedupedServiceIds
+          })
+        ]
+      );
+
+      const [rows] = await connection.query(
+        `SELECT ts.service_id, ts.is_active, ts.round_robin_order, s.name AS service_name
+         FROM therapist_services ts
+         JOIN services s ON s.id = ts.service_id
+         WHERE ts.center_id = ?
+           AND ts.therapist_id = ?
+         ORDER BY ts.round_robin_order ASC, ts.service_id ASC`,
+        [centerId, therapistId]
+      );
+
+      return rows.map((row) => ({
+        serviceId: row.service_id,
+        serviceName: row.service_name,
+        roundRobinOrder: Number(row.round_robin_order || 0),
+        isActive: Boolean(row.is_active)
+      }));
+    });
+
+    res.json({
+      ok: true,
+      therapistId,
+      services: response
+    });
+  })
+);
+
+router.get(
+  '/therapists/:id/schedule',
+  asyncHandler(async (req, res) => {
+    const centerId = Number(req.user.centerId || 1);
+    const therapistId = Number(req.params.id);
+    if (!Number.isFinite(therapistId) || therapistId <= 0) {
+      throw new ValidationError('Invalid therapist id');
+    }
+
+    const [therapistRows] = await pool.query(
+      `SELECT id
+       FROM therapists
+       WHERE center_id = ? AND id = ?
+       LIMIT 1`,
+      [centerId, therapistId]
+    );
+
+    if (!therapistRows[0]) {
+      throw new AppError('Therapist not found', 404, 'not_found');
+    }
+
+    const [rows] = await pool.query(
+      `SELECT weekday, start_time, end_time, is_active
+       FROM resource_schedules
+       WHERE center_id = ?
+         AND resource_type = 'therapist'
+         AND resource_id = ?
+       ORDER BY weekday ASC, start_time ASC`,
+      [centerId, therapistId]
+    );
+
+    res.json({
+      ok: true,
+      therapistId,
+      schedule: rows.map((row) => ({
+        weekday: Number(row.weekday),
+        startTime: String(row.start_time),
+        endTime: String(row.end_time),
+        isActive: Boolean(row.is_active)
+      }))
+    });
+  })
+);
+
+router.put(
+  '/therapists/:id/schedule',
+  asyncHandler(async (req, res) => {
+    const centerId = Number(req.user.centerId || 1);
+    const therapistId = Number(req.params.id);
+    if (!Number.isFinite(therapistId) || therapistId <= 0) {
+      throw new ValidationError('Invalid therapist id');
+    }
+
+    const input = UpdateTherapistScheduleSchema.parse(req.body || {});
+    const entries = normalizeScheduleEntries(input.entries);
+
+    await withTransaction(async (connection) => {
+      const [therapistRows] = await connection.query(
+        `SELECT id
+         FROM therapists
+         WHERE center_id = ? AND id = ?
+         LIMIT 1
+         FOR UPDATE`,
+        [centerId, therapistId]
+      );
+
+      if (!therapistRows[0]) {
+        throw new AppError('Therapist not found', 404, 'not_found');
+      }
+
+      await connection.query(
+        `DELETE FROM resource_schedules
+         WHERE center_id = ?
+           AND resource_type = 'therapist'
+           AND resource_id = ?`,
+        [centerId, therapistId]
+      );
+
+      for (const entry of entries) {
+        await connection.query(
+          `INSERT INTO resource_schedules
+            (center_id, resource_type, resource_id, weekday, start_time, end_time, is_active)
+           VALUES (?, 'therapist', ?, ?, ?, ?, ?)`,
+          [
+            centerId,
+            therapistId,
+            entry.weekday,
+            entry.startTime,
+            entry.endTime,
+            entry.isActive ? 1 : 0
+          ]
+        );
+      }
+    });
+
+    res.json({
+      ok: true,
+      therapistId,
+      schedule: entries
+    });
+  })
+);
+
+router.post(
+  '/services',
+  asyncHandler(async (req, res) => {
+    const centerId = Number(req.user.centerId || 1);
+    const input = CreateServiceSchema.parse(req.body || {});
+    const currency = input.currency.toUpperCase();
+
+    const result = await withTransaction(async (connection) => {
+      const [insert] = await connection.query(
+        `INSERT INTO services
+          (center_id, name, description, duration_min, base_price_cents, currency, is_featured, is_active)
+         VALUES (?, ?, ?, ?, ?, ?, 0, ?)`,
+        [
+          centerId,
+          input.name,
+          toNullable(input.description),
+          input.durationMin,
+          input.basePriceCents,
+          currency,
+          input.isActive ? 1 : 0
+        ]
+      );
+
+      const serviceId = Number(insert.insertId);
+
+      const [roomRows] = await connection.query(
+        `SELECT id
+         FROM rooms
+         WHERE center_id = ?
+           AND is_active = 1`,
+        [centerId]
+      );
+
+      for (const row of roomRows) {
+        await connection.query(
+          `INSERT IGNORE INTO service_rooms (center_id, service_id, room_id)
+           VALUES (?, ?, ?)`,
+          [centerId, serviceId, row.id]
+        );
+      }
+
+      const [rows] = await connection.query(
+        `SELECT id, name, description, duration_min, base_price_cents, currency, is_active
+         FROM services
+         WHERE center_id = ? AND id = ?
+         LIMIT 1`,
+        [centerId, serviceId]
+      );
+
+      return rows[0];
+    });
+
+    res.status(201).json({
+      ok: true,
+      service: {
+        id: result.id,
+        name: result.name,
+        description: result.description,
+        durationMin: Number(result.duration_min),
+        basePriceCents: Number(result.base_price_cents),
+        currency: result.currency,
+        isActive: Boolean(result.is_active)
+      }
+    });
+  })
+);
+
+router.patch(
+  '/services/:id',
+  asyncHandler(async (req, res) => {
+    const centerId = Number(req.user.centerId || 1);
+    const serviceId = Number(req.params.id);
+    if (!Number.isFinite(serviceId) || serviceId <= 0) {
+      throw new ValidationError('Invalid service id');
+    }
+
+    const input = UpdateServiceSchema.parse(req.body || {});
+    const updates = [];
+    const params = [];
+
+    if (input.name !== undefined) {
+      updates.push('name = ?');
+      params.push(input.name);
+    }
+
+    if (input.description !== undefined) {
+      updates.push('description = ?');
+      params.push(toNullable(input.description));
+    }
+
+    if (input.durationMin !== undefined) {
+      updates.push('duration_min = ?');
+      params.push(input.durationMin);
+    }
+
+    if (input.basePriceCents !== undefined) {
+      updates.push('base_price_cents = ?');
+      params.push(input.basePriceCents);
+    }
+
+    if (input.currency !== undefined) {
+      updates.push('currency = ?');
+      params.push(input.currency.toUpperCase());
+    }
+
+    if (input.isActive !== undefined) {
+      updates.push('is_active = ?');
+      params.push(input.isActive ? 1 : 0);
+    }
+
+    params.push(serviceId, centerId);
+
+    const [result] = await pool.query(
+      `UPDATE services
+       SET ${updates.join(', ')}, updated_at = CURRENT_TIMESTAMP
+       WHERE id = ? AND center_id = ?`,
+      params
+    );
+
+    if (!result.affectedRows) {
+      throw new AppError('Service not found', 404, 'not_found');
+    }
+
+    const [rows] = await pool.query(
+      `SELECT id, name, description, duration_min, base_price_cents, currency, is_active
+       FROM services
+       WHERE center_id = ? AND id = ?
+       LIMIT 1`,
+      [centerId, serviceId]
+    );
+
+    res.json({
+      ok: true,
+      service: {
+        id: rows[0].id,
+        name: rows[0].name,
+        description: rows[0].description,
+        durationMin: Number(rows[0].duration_min),
+        basePriceCents: Number(rows[0].base_price_cents),
+        currency: rows[0].currency,
+        isActive: Boolean(rows[0].is_active)
+      }
+    });
+  })
+);
+
+router.post(
+  '/rooms',
+  asyncHandler(async (req, res) => {
+    const centerId = Number(req.user.centerId || 1);
+    const input = CreateRoomSchema.parse(req.body || {});
+
+    const result = await withTransaction(async (connection) => {
+      const [insert] = await connection.query(
+        `INSERT INTO rooms (center_id, name, capacity, is_active)
+         VALUES (?, ?, ?, ?)`,
+        [centerId, input.name, input.capacity, input.isActive ? 1 : 0]
+      );
+
+      const roomId = Number(insert.insertId);
+
+      const [serviceRows] = await connection.query(
+        `SELECT id
+         FROM services
+         WHERE center_id = ?
+           AND is_active = 1`,
+        [centerId]
+      );
+
+      for (const row of serviceRows) {
+        await connection.query(
+          `INSERT IGNORE INTO service_rooms (center_id, service_id, room_id)
+           VALUES (?, ?, ?)`,
+          [centerId, row.id, roomId]
+        );
+      }
+
+      const [rows] = await connection.query(
+        `SELECT id, name, capacity, is_active
+         FROM rooms
+         WHERE center_id = ? AND id = ?
+         LIMIT 1`,
+        [centerId, roomId]
+      );
+
+      return rows[0];
+    });
+
+    res.status(201).json({
+      ok: true,
+      room: {
+        id: result.id,
+        name: result.name,
+        capacity: Number(result.capacity),
+        isActive: Boolean(result.is_active)
+      }
+    });
+  })
+);
+
+router.patch(
+  '/rooms/:id',
+  asyncHandler(async (req, res) => {
+    const centerId = Number(req.user.centerId || 1);
+    const roomId = Number(req.params.id);
+    if (!Number.isFinite(roomId) || roomId <= 0) {
+      throw new ValidationError('Invalid room id');
+    }
+
+    const input = UpdateRoomSchema.parse(req.body || {});
+    const updates = [];
+    const params = [];
+
+    if (input.name !== undefined) {
+      updates.push('name = ?');
+      params.push(input.name);
+    }
+
+    if (input.capacity !== undefined) {
+      updates.push('capacity = ?');
+      params.push(input.capacity);
+    }
+
+    if (input.isActive !== undefined) {
+      updates.push('is_active = ?');
+      params.push(input.isActive ? 1 : 0);
+    }
+
+    params.push(roomId, centerId);
+
+    const [result] = await pool.query(
+      `UPDATE rooms
+       SET ${updates.join(', ')}, updated_at = CURRENT_TIMESTAMP
+       WHERE id = ? AND center_id = ?`,
+      params
+    );
+
+    if (!result.affectedRows) {
+      throw new AppError('Room not found', 404, 'not_found');
+    }
+
+    const [rows] = await pool.query(
+      `SELECT id, name, capacity, is_active
+       FROM rooms
+       WHERE center_id = ? AND id = ?
+       LIMIT 1`,
+      [centerId, roomId]
+    );
+
+    res.json({
+      ok: true,
+      room: {
+        id: rows[0].id,
+        name: rows[0].name,
+        capacity: Number(rows[0].capacity),
+        isActive: Boolean(rows[0].is_active)
+      }
+    });
+  })
+);
+
+router.get(
+  '/catalog',
+  asyncHandler(async (req, res) => {
+    const centerId = Number(req.user.centerId || 1);
+
+    const [[center], [services], [therapists], [rooms], [therapistServices]] = await Promise.all([
+      pool.query(
+        `SELECT c.id, c.slug, c.name, c.timezone, c.locale, c.status,
+                cs.brand_name, cs.logo_url, cs.whatsapp_number, cs.support_whatsapp_text,
+                cs.primary_color, cs.accent_color
+         FROM centers c
+         LEFT JOIN center_settings cs ON cs.center_id = c.id
+         WHERE c.id = ?
+         LIMIT 1`,
+        [centerId]
+      ),
+      pool.query(
+        `SELECT id, name, description, duration_min, base_price_cents, currency, is_active
+         FROM services
+         WHERE center_id = ?
+         ORDER BY is_active DESC, name ASC`,
+        [centerId]
+      ),
+      pool.query(
+        `SELECT id, full_name, bio_short, phone, email, commission_pct, is_active
+         FROM therapists
+         WHERE center_id = ?
+         ORDER BY is_active DESC, full_name ASC`,
+        [centerId]
+      ),
+      pool.query(
+        `SELECT id, name, capacity, is_active
+         FROM rooms
+         WHERE center_id = ?
+         ORDER BY is_active DESC, name ASC`,
+        [centerId]
+      ),
+      pool.query(
+        `SELECT therapist_id, service_id, round_robin_order, is_active
+         FROM therapist_services
+         WHERE center_id = ?
+         ORDER BY therapist_id ASC, round_robin_order ASC, service_id ASC`,
+        [centerId]
+      )
+    ]);
+
+    if (!center) {
+      throw new AppError('Center not found', 404, 'not_found');
+    }
+
+    const therapistServicesMap = new Map();
+    for (const row of therapistServices) {
+      const current = therapistServicesMap.get(row.therapist_id) || [];
+      current.push({
+        serviceId: row.service_id,
+        roundRobinOrder: Number(row.round_robin_order || 0),
+        isActive: Boolean(row.is_active)
+      });
+      therapistServicesMap.set(row.therapist_id, current);
+    }
+
+    res.json({
+      ok: true,
+      center: {
+        id: center.id,
+        slug: center.slug,
+        name: center.name,
+        timezone: center.timezone,
+        locale: center.locale,
+        status: center.status,
+        brandName: center.brand_name || center.name,
+        logoUrl: center.logo_url || '',
+        whatsappNumber: center.whatsapp_number || '',
+        supportWhatsappText: center.support_whatsapp_text || '',
+        primaryColor: center.primary_color || '',
+        accentColor: center.accent_color || ''
+      },
+      services: services.map((row) => ({
+        id: row.id,
+        name: row.name,
+        description: row.description,
+        durationMin: Number(row.duration_min),
+        basePriceCents: Number(row.base_price_cents),
+        currency: row.currency,
+        isActive: Boolean(row.is_active)
+      })),
+      therapists: therapists.map((row) => ({
+        id: row.id,
+        fullName: row.full_name,
+        bioShort: row.bio_short,
+        phone: row.phone,
+        email: row.email,
+        commissionPct: Number(row.commission_pct),
+        isActive: Boolean(row.is_active),
+        services: therapistServicesMap.get(row.id) || []
+      })),
+      rooms: rooms.map((row) => ({
+        id: row.id,
+        name: row.name,
+        capacity: Number(row.capacity),
+        isActive: Boolean(row.is_active)
+      }))
+    });
+  })
+);
+
+router.post(
+  '/availability',
+  asyncHandler(async (req, res) => {
+    const centerId = Number(req.user.centerId || 1);
+    const input = AdminAvailabilitySchema.parse(req.body || {});
+
+    const availability = await listAvailability(pool, {
+      centerId,
+      serviceId: input.serviceId,
+      date: input.date,
+      therapistId: input.therapistId ?? null,
+      maxSlots: 80
+    });
+
+    res.json({ ok: true, ...availability });
+  })
+);
+
+router.post(
+  '/appointments',
+  asyncHandler(async (req, res) => {
+    const centerId = Number(req.user.centerId || 1);
+    const input = CreateAdminAppointmentSchema.parse(req.body || {});
+
+    const result = await withTransaction(async (connection) => {
+      const [serviceRows] = await connection.query(
+        `SELECT id, duration_min, base_price_cents, currency
+         FROM services
+         WHERE center_id = ? AND id = ? AND is_active = 1
+         LIMIT 1`,
+        [centerId, input.serviceId]
+      );
+
+      const service = serviceRows[0];
+      if (!service) {
+        throw new ValidationError('Service does not exist or is inactive');
+      }
+
+      const requestedStart = fromMySqlDateTime(input.startsAt);
+      const requestedEnd = addMinutes(requestedStart, Number(service.duration_min));
+      const lockKey = `luna:admin-book:${centerId}:${service.id}:${toMySqlDateTime(requestedStart).slice(0, 16)}`;
+
+      return withLock(connection, lockKey, async () => {
+        const availability = await listAvailability(connection, {
+          centerId,
+          serviceId: service.id,
+          date: toDateOnlyInAppTz(requestedStart),
+          therapistId: input.therapistId ?? null,
+          maxSlots: 100
+        });
+
+        const requestedMinute = toComparableMinute(input.startsAt);
+        const slot = availability.slots.find((item) => toComparableMinute(item.startsAt) === requestedMinute);
+
+        if (!slot) {
+          throw new ConflictError('Requested slot is not available');
+        }
+
+        let candidate = pickAdminCandidate(slot, {
+          therapistId: input.therapistId ?? null
+        });
+
+        if (!candidate && input.therapistId === undefined) {
+          const state = await getRoundRobinState(connection, centerId, service.id);
+          const chosen = chooseRoundRobinTherapist({
+            candidates: slot.therapists || [],
+            lastTherapistId: state.last_therapist_id,
+            loadsByTherapist: {}
+          });
+
+          if (chosen) {
+            candidate = pickAdminCandidate(slot, { therapistId: chosen.therapistId });
+          }
+        }
+
+        if (!candidate) {
+          throw new ConflictError('No therapist-room pair available for this slot');
+        }
+
+        let clientId = input.clientId ? Number(input.clientId) : null;
+        if (clientId) {
+          const [clientRows] = await connection.query(
+            `SELECT id
+             FROM clients
+             WHERE center_id = ? AND id = ?
+             LIMIT 1`,
+            [centerId, clientId]
+          );
+          if (!clientRows[0]) {
+            throw new ValidationError('Client not found');
+          }
+        } else {
+          const clientInput = input.client;
+          const [clientInsert] = await connection.query(
+            `INSERT INTO clients (center_id, full_name, whatsapp_phone, email, notes)
+             VALUES (?, ?, ?, ?, ?)
+             ON DUPLICATE KEY UPDATE
+              full_name = VALUES(full_name),
+              email = VALUES(email),
+              notes = VALUES(notes),
+              updated_at = CURRENT_TIMESTAMP`,
+            [
+              centerId,
+              clientInput.fullName,
+              clientInput.whatsappPhone,
+              toNullable(clientInput.email),
+              toNullable(clientInput.notes)
+            ]
+          );
+
+          if (clientInsert.insertId) {
+            clientId = Number(clientInsert.insertId);
+          } else {
+            const [clientRows] = await connection.query(
+              `SELECT id
+               FROM clients
+               WHERE center_id = ? AND whatsapp_phone = ?
+               LIMIT 1`,
+              [centerId, clientInput.whatsappPhone]
+            );
+            clientId = Number(clientRows[0].id);
+          }
+        }
+
+        const [appointmentInsert] = await connection.query(
+          `INSERT INTO appointments
+            (center_id, client_id, service_id, therapist_id, room_id, starts_at, ends_at, status, source, payment_status, notes)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'confirmed', 'admin', 'pending', ?)`,
+          [
+            centerId,
+            clientId,
+            service.id,
+            candidate.therapistId,
+            candidate.roomId,
+            toMySqlDateTime(requestedStart),
+            toMySqlDateTime(requestedEnd),
+            toNullable(input.note)
+          ]
+        );
+
+        const appointmentId = Number(appointmentInsert.insertId);
+
+        await createClaimsTx(connection, {
+          centerId,
+          appointmentId,
+          therapistId: candidate.therapistId,
+          roomId: candidate.roomId,
+          startsAt: requestedStart,
+          endsAt: requestedEnd
+        });
+
+        await connection.query(
+          `INSERT INTO payments
+            (center_id, appointment_id, amount_cents, currency, status, method)
+           VALUES (?, ?, ?, ?, 'pending', 'transfer')`,
+          [centerId, appointmentId, service.base_price_cents, service.currency]
+        );
+
+        await advanceRoundRobinTx(connection, {
+          centerId,
+          serviceId: service.id,
+          therapistId: candidate.therapistId
+        });
+
+        await connection.query(
+          `INSERT INTO audit_logs
+            (center_id, actor_type, entity_type, entity_id, action, metadata_json)
+           VALUES (?, 'admin', 'appointment', ?, 'appointment_created_admin', ?)`,
+          [
+            centerId,
+            appointmentId,
+            JSON.stringify({
+              therapistId: candidate.therapistId,
+              roomId: candidate.roomId,
+              startsAt: toMySqlDateTime(requestedStart),
+              endsAt: toMySqlDateTime(requestedEnd),
+              note: toNullable(input.note)
+            })
+          ]
+        );
+
+        const appointment = await getAppointmentRow(connection, centerId, appointmentId);
+        return serializeAppointmentRow(appointment);
+      });
+    });
+
+    res.status(201).json({ ok: true, appointment: result });
+  })
+);
+
+router.get(
+  '/appointments/:id',
+  asyncHandler(async (req, res) => {
+    const centerId = Number(req.user.centerId || 1);
+    const appointmentId = Number(req.params.id);
+    if (!Number.isFinite(appointmentId) || appointmentId <= 0) {
+      throw new ValidationError('Invalid appointment id');
+    }
+
+    const row = await getAppointmentRow(pool, centerId, appointmentId);
+    if (!row) {
+      throw new AppError('Appointment not found', 404, 'not_found');
+    }
+
+    const [payments, logs] = await Promise.all([
+      pool.query(
+        `SELECT id, amount_cents, currency, status, method, created_at, updated_at
+         FROM payments
+         WHERE center_id = ? AND appointment_id = ?
+         ORDER BY id ASC`,
+        [centerId, appointmentId]
+      ),
+      pool.query(
+        `SELECT id, actor_type, actor_id, action, metadata_json, created_at
+         FROM audit_logs
+         WHERE center_id = ?
+           AND entity_type = 'appointment'
+           AND entity_id = ?
+         ORDER BY created_at DESC
+         LIMIT 120`,
+        [centerId, appointmentId]
+      )
+    ]);
+
+    res.json({
+      ok: true,
+      appointment: serializeAppointmentRow(row),
+      payments: payments[0].map((item) => ({
+        id: item.id,
+        amountCents: Number(item.amount_cents || 0),
+        currency: item.currency,
+        status: item.status,
+        method: item.method,
+        createdAt: item.created_at,
+        updatedAt: item.updated_at
+      })),
+      audit: logs[0].map((item) => ({
+        id: item.id,
+        actorType: item.actor_type,
+        actorId: item.actor_id,
+        action: item.action,
+        metadata: parseOptionalJson(item.metadata_json),
+        createdAt: item.created_at
+      }))
+    });
+  })
+);
+
+router.patch(
+  '/appointments/:id/status',
+  asyncHandler(async (req, res) => {
+    const centerId = Number(req.user.centerId || 1);
+    const appointmentId = Number(req.params.id);
+    if (!Number.isFinite(appointmentId) || appointmentId <= 0) {
+      throw new ValidationError('Invalid appointment id');
+    }
+
+    const input = UpdateAppointmentStatusSchema.parse(req.body || {});
+
+    const appointment = await withTransaction(async (connection) => {
+      const current = await getAppointmentRow(connection, centerId, appointmentId, { forUpdate: true });
+      if (!current) {
+        throw new AppError('Appointment not found', 404, 'not_found');
+      }
+
+      if (current.status === input.status) {
+        return serializeAppointmentRow(current);
+      }
+
+      await connection.query(
+        `UPDATE appointments
+         SET status = ?,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE center_id = ? AND id = ?`,
+        [input.status, centerId, appointmentId]
+      );
+
+      if (['completed', 'cancelled', 'no_show'].includes(input.status)) {
+        await releaseClaimsTx(connection, { centerId, appointmentId });
+      }
+
+      await connection.query(
+        `INSERT INTO audit_logs
+          (center_id, actor_type, entity_type, entity_id, action, metadata_json)
+         VALUES (?, 'admin', 'appointment', ?, 'appointment_status_updated', ?)`,
+        [
+          centerId,
+          appointmentId,
+          JSON.stringify({
+            previousStatus: current.status,
+            nextStatus: input.status,
+            note: toNullable(input.note)
+          })
+        ]
+      );
+
+      const updated = await getAppointmentRow(connection, centerId, appointmentId);
+      return serializeAppointmentRow(updated);
+    });
+
+    res.json({ ok: true, appointment });
+  })
+);
+
+router.patch(
+  '/appointments/:id/reschedule',
+  asyncHandler(async (req, res) => {
+    const centerId = Number(req.user.centerId || 1);
+    const appointmentId = Number(req.params.id);
+    if (!Number.isFinite(appointmentId) || appointmentId <= 0) {
+      throw new ValidationError('Invalid appointment id');
+    }
+
+    const input = RescheduleAppointmentSchema.parse(req.body || {});
+
+    const appointment = await withTransaction(async (connection) => {
+      const current = await getAppointmentRow(connection, centerId, appointmentId, { forUpdate: true });
+      if (!current) {
+        throw new AppError('Appointment not found', 404, 'not_found');
+      }
+
+      if (!['pending', 'confirmed'].includes(current.status)) {
+        throw new ConflictError('Only pending or confirmed appointments can be rescheduled');
+      }
+
+      const requestedStart = fromMySqlDateTime(input.startsAt);
+      const requestedEnd = addMinutes(requestedStart, Number(current.duration_min));
+
+      const sameMinute = toComparableMinute(current.starts_at) === toComparableMinute(input.startsAt);
+      const sameTherapist =
+        input.therapistId === undefined || input.therapistId === null
+          ? true
+          : Number(input.therapistId) === Number(current.therapist_id);
+      const sameRoom =
+        input.roomId === undefined || input.roomId === null
+          ? true
+          : Number(input.roomId) === Number(current.room_id);
+
+      if (sameMinute && sameTherapist && sameRoom) {
+        return serializeAppointmentRow(current);
+      }
+
+      const availability = await listAvailability(connection, {
+        centerId,
+        serviceId: current.service_id,
+        date: toDateOnlyInAppTz(requestedStart),
+        therapistId: input.therapistId ?? null,
+        maxSlots: 100
+      });
+
+      const requestedMinute = toComparableMinute(input.startsAt);
+      const slot = availability.slots.find((item) => toComparableMinute(item.startsAt) === requestedMinute);
+
+      if (!slot) {
+        throw new ConflictError('Requested slot is not available');
+      }
+
+      const preferredTherapistId =
+        input.therapistId === undefined || input.therapistId === null
+          ? Number(current.therapist_id)
+          : input.therapistId;
+      const preferredRoomId =
+        input.roomId === undefined || input.roomId === null ? Number(current.room_id) : input.roomId;
+
+      const candidate = pickAdminCandidate(slot, {
+        therapistId: preferredTherapistId,
+        roomId: preferredRoomId
+      });
+
+      if (!candidate) {
+        throw new ConflictError('No therapist-room pair available for this slot');
+      }
+
+      await releaseClaimsTx(connection, { centerId, appointmentId });
+
+      await createClaimsTx(connection, {
+        centerId,
+        appointmentId,
+        therapistId: candidate.therapistId,
+        roomId: candidate.roomId,
+        startsAt: requestedStart,
+        endsAt: requestedEnd
+      });
+
+      await connection.query(
+        `UPDATE appointments
+         SET therapist_id = ?,
+             room_id = ?,
+             starts_at = ?,
+             ends_at = ?,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE center_id = ? AND id = ?`,
+        [
+          candidate.therapistId,
+          candidate.roomId,
+          toMySqlDateTime(requestedStart),
+          toMySqlDateTime(requestedEnd),
+          centerId,
+          appointmentId
+        ]
+      );
+
+      await connection.query(
+        `INSERT INTO audit_logs
+          (center_id, actor_type, entity_type, entity_id, action, metadata_json)
+         VALUES (?, 'admin', 'appointment', ?, 'appointment_rescheduled_admin', ?)`,
+        [
+          centerId,
+          appointmentId,
+          JSON.stringify({
+            previous: {
+              therapistId: current.therapist_id,
+              roomId: current.room_id,
+              startsAt: current.starts_at,
+              endsAt: current.ends_at
+            },
+            next: {
+              therapistId: candidate.therapistId,
+              roomId: candidate.roomId,
+              startsAt: toMySqlDateTime(requestedStart),
+              endsAt: toMySqlDateTime(requestedEnd)
+            },
+            note: toNullable(input.note)
+          })
+        ]
+      );
+
+      const updated = await getAppointmentRow(connection, centerId, appointmentId);
+      return serializeAppointmentRow(updated);
+    });
+
+    res.json({ ok: true, appointment });
   })
 );
 

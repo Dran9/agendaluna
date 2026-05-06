@@ -11,6 +11,8 @@ No es una version reducida de Super Agenda. Es un producto nuevo con otra restri
 - `IMPLEMENTATION_HANDOFF_CODEX53.md`: instrucciones directas para que Codex 5.3 implemente.
 - `ROADMAP_ENGINEERING_PLAN.md`: fases, gates y riesgos de ejecucion.
 - `design.md`: lenguaje visual activo.
+- `CHANGELOG.md`: historial acumulativo de cambios por fase/fecha.
+- `C0_ADMIN_OPERATIONS_DELIVERY_2026-05-06.md`: registro de implementacion de fase C0 (backend, frontend, tests y validacion).
 - `superagenda.md`: deprecado; conservar solo como referencia historica.
 
 ## Decision De Producto

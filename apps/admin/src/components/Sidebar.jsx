@@ -16,12 +16,22 @@ const items = [
   { id: 'ajustes', label: 'Ajustes', icon: SlidersHorizontal }
 ];
 
-export function Sidebar({ theme, onToggleTheme, activeView, onNavigate }) {
+export function Sidebar({ theme, onToggleTheme, activeView, onNavigate, brandName = 'Luna', logoUrl = '' }) {
+  const initials = String(brandName || 'Luna')
+    .split(' ')
+    .filter(Boolean)
+    .slice(0, 2)
+    .map((part) => part[0])
+    .join('')
+    .toUpperCase()
+
   return (
     <aside className="sidebar">
       <div className="brand-slot" aria-label="Logo del centro">
-        <div className="brand-mark">LM</div>
-        <span className="brand-name">Luna</span>
+        <div className="brand-mark">
+          {logoUrl ? <img src={logoUrl} alt={brandName} /> : <span>{initials || 'LM'}</span>}
+        </div>
+        <span className="brand-name">{brandName}</span>
       </div>
 
       <nav className="sidebar-nav" aria-label="Navegacion principal">
